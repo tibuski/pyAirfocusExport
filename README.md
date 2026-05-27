@@ -34,8 +34,11 @@ uv run pyAirfocusExport.py --parent "Objective Workspace Name"
 ```python
 apikey = "your_api_key_here"
 baseurl = "https://app.airfocus.com"
+airfocus_coproduct = "v2"
 ignore_ssl_cert_check = True
 ```
+
+If airfocus support asks you to temporarily restore legacy filter behavior, set `airfocus_coproduct = "v1"`.
 
 ## Dependencies
 
@@ -43,14 +46,14 @@ Python standard library only. No third-party packages.
 
 ## CSV Output
 
-Dynamic columns per hierarchy depth:
+Dynamic columns per hierarchy depth use `Parent` for the top level, then child-style prefixes such as `Child0`, `Child0-0`, `Child0-0-0`.
 
 | Column | Description |
 |---|---|
-| `Parent{N}` | Objective workspace name at depth N |
-| `Parent{N}_Item` | Objective item name |
-| `Parent{N}_ChildItem` | Child objective (within same workspace) |
-| `Parent{N}_KeyResult` | Key result alias linked to the objective |
+| `Parent` / `Child...` | Objective workspace name for that hierarchy level |
+| `Parent_Objective` / `Child..._Objective` | Objective name |
+| `Parent_ChildObjective` / `Child..._ChildObjective` | Child objective (within same workspace) |
+| `Parent_KeyResult` / `Child..._KeyResult` | Key result alias when available, otherwise the key result title |
 | `Status` | Empty placeholder column; workspace status metadata is not queried |
 | `Confidence` | OKR confidence (high/medium/low) |
 | `Progress` | Progress percentage |
@@ -60,6 +63,7 @@ Dynamic columns per hierarchy depth:
 
 - API key: Bearer token in `Authorization` header
 - Content type: `application/json`
+- Optional coproduct pin: `x-airfocus-coproduct: v2` by default, with `v1` available as a fallback
 - Base URL: `https://app.airfocus.com`
 - Full spec: `https://developer.airfocus.com/openapi.json`
 
@@ -69,6 +73,7 @@ Dynamic columns per hierarchy depth:
 - Running with `--parent` writes a CSV file named `Output\[date-time]-[parent-name].csv`
 - Logs progress and API errors to stderr
 - Paginates workspace items with a page size of 1000
+- Resolves key results from objective OKR fields and from linked workspace items that reference those objectives
 - Accepts either the full workspace name or the workspace short name / alias in `--parent`
 - Prints available objective workspaces when `--parent` is not found
 - Supports `ignore_ssl_cert_check = True` in `config.py` for environments with intercepted TLS certificates

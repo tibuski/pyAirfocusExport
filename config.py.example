@@ -7,5 +7,10 @@ apikey = "your_api_key_here"
 # API Base URL
 baseurl = "https://app.airfocus.com"
 
+# airfocus API coproduct version
+# Use "v2" to stay aligned with the June 1 default.
+# If airfocus support asks you to restore legacy behavior, switch this to "v1".
+airfocus_coproduct = "v2"
+
 # SSL Handling
 ignore_ssl_cert_check = True

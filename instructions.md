@@ -25,33 +25,33 @@ Columns are generated dynamically based on the hierarchy depth. The hierarchy is
 
 ```
 Objective Workspace (e.g., Company OKRs)
-  └── Objective Item (parent objective, Parent0_Item)
-        └── Child Objective Item (child objective within same workspace, Parent0_ChildItem)
-              └── Key Results linked to child objective (Parent0_KeyResult)
-        └── Key Results linked to parent objective (Parent0_KeyResult)
-  └── Child Objective Workspace (e.g., Team OKRs)  →  Parent1
-        └── Objective Item (Parent1_Item)
-              └── Child Objective Item (Parent1_ChildItem)
-                    └── Key Results (Parent1_KeyResult)
-              └── Key Results (Parent1_KeyResult)
+  └── Objective (parent objective, Parent_Objective)
+        └── Child Objective (child objective within same workspace, Parent_ChildObjective)
+              └── Key Results linked to child objective (Parent_KeyResult)
+        └── Key Results linked to parent objective (Parent_KeyResult)
+  └── Child Objective Workspace (e.g., Team OKRs)  →  Child0
+        └── Objective (Child0_Objective)
+              └── Child Objective (Child0_ChildObjective)
+                    └── Key Results (Child0_KeyResult)
+              └── Key Results (Child0_KeyResult)
 ```
 
 Each row represents a path through the hierarchy: workspace → objective → child objective → key result.
 
 ### Dynamic Path Columns
 
-For each depth level N (0 = outermost objective workspace, increasing inward):
+The top-level workspace columns use `Parent`. Deeper workspace levels use child prefixes such as `Child0`, `Child0-0`, `Child0-0-0`.
 
 | Column | Description |
 |---|---|
-| `Parent{N}` | Name of the objective workspace at this depth |
-| `Parent{N}_Item` | Name of the parent objective item in this workspace |
-| `Parent{N}_ChildItem` | Name of a child objective (within same workspace, under the parent item) |
-| `Parent{N}_KeyResult` | Alias (e.g., `OKR-42`) of the key result linked to the deepest objective |
+| `Parent` / `Child...` | Name of the objective workspace at this depth |
+| `Parent_Objective` / `Child..._Objective` | Name of the parent objective in this workspace |
+| `Parent_ChildObjective` / `Child..._ChildObjective` | Name of a child objective (within same workspace, under the parent objective) |
+| `Parent_KeyResult` / `Child..._KeyResult` | Alias (e.g., `OKR-42`) when available, otherwise the key result title |
 
-If an objective has no child item, `ChildItem` is left empty and `KeyResult` applies to the parent objective directly.
+If an objective has no child objective, `ChildObjective` is left empty and `KeyResult` applies to the parent objective directly.
 
-Example for a 2-level hierarchy: `Parent0`, `Parent0_Item`, `Parent0_ChildItem`, `Parent0_KeyResult`, `Parent1`, `Parent1_Item`, `Parent1_ChildItem`, `Parent1_KeyResult`.
+Example for a 2-level hierarchy: `Parent`, `Parent_Objective`, `Parent_ChildObjective`, `Parent_KeyResult`, `Child0`, `Child0_Objective`, `Child0_ChildObjective`, `Child0_KeyResult`.
 
 ### Static Columns
 
@@ -122,6 +122,7 @@ config.py                    # API key and base URL (gitignored)
 ```python
 apikey = "your_api_key_here"
 baseurl = "https://app.airfocus.com"
+airfocus_coproduct = "v2"
 ignore_ssl_cert_check = True
 ```
 
@@ -131,6 +132,7 @@ Send the API key in every request as an HTTP header:
 ```
 Authorization: Bearer <apikey>
 ```
+Also send `x-airfocus-coproduct: v2` by default. If airfocus support asks to temporarily restore the legacy behavior, switch `airfocus_coproduct` in `config.py` to `"v1"`.
 Use `Content-Type: application/json` and accept `application/json` (or `application/vnd.airfocus.markdown+json` for markdown descriptions).
 
 ## Algorithm
@@ -148,8 +150,9 @@ Use `Content-Type: application/json` and accept `application/json` (or `applicat
 
 5. **Extract items and key results** — For each workspace in the hierarchy:
    - Fetch all items via `POST /api/workspaces/{id}/items/search`.
-   - For each item, read the `okr-key-results` field to get linked key result UUIDs.
-   - Resolve key result details via `POST /api/workspaces/{workspaceId}/items/list`.
+      - For each item, read the `okr-key-results` and `okr-key-result-reference` fields to get linked key result UUIDs.
+      - Also resolve key results from linked workspaces configured in the OKR app when those items reference the objective through the linked workspace `keyResultReferenceFieldId`.
+      - Resolve key result details via `POST /api/workspaces/{workspaceId}/items/list` when the key result item IDs are already known.
    - Read `okr-confidence`, `okr-progress`, and `okr-time-period` from item fields.
 
 6. **Build parent-child relationships** — Use `_embedded.parents` and `_embedded.children` on each item to reconstruct the hierarchy.

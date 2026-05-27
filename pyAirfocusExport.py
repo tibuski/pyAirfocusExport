@@ -80,6 +80,8 @@ def load_config():
 
     if not hasattr(config_module, "ignore_ssl_cert_check"):
         config_module.ignore_ssl_cert_check = True
+    if not hasattr(config_module, "airfocus_coproduct"):
+        config_module.airfocus_coproduct = "v2"
 
     print(
         f"Loaded config.py with apikey={obfuscate_secret(config_module.apikey)}",
@@ -122,6 +124,9 @@ def api_request(config, method, path, body=None, params=None):
     req.add_header("Authorization", f"Bearer {config.apikey}")
     req.add_header("Content-Type", CONTENT_TYPE)
     req.add_header("Accept", CONTENT_TYPE)
+    coproduct = getattr(config, "airfocus_coproduct", None)
+    if coproduct:
+        req.add_header("x-airfocus-coproduct", str(coproduct))
 
     ssl_context = None
     if getattr(config, "ignore_ssl_cert_check", True):
@@ -175,6 +180,81 @@ def get_workspace_label(workspace):
 
 def get_workspace_alias(workspace):
     return workspace.get("alias") or ""
+
+
+def get_okr_app_settings(workspace):
+    embedded = workspace.get("_embedded", {})
+    for app in normalize_embedded_collection(embedded.get("apps")):
+        if app.get("typeId") == "okr":
+            settings = app.get("settings")
+            if isinstance(settings, dict):
+                return settings
+    return {}
+
+
+def normalize_settings_collection(value):
+    if isinstance(value, dict):
+        return [item for item in value.values() if isinstance(item, dict)]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def find_workspace_settings_entry(settings_collection, workspace_id):
+    if not workspace_id:
+        return {}
+
+    if isinstance(settings_collection, dict):
+        direct = settings_collection.get(workspace_id)
+        if isinstance(direct, dict):
+            return direct
+
+    for entry in normalize_settings_collection(settings_collection):
+        if entry.get("workspaceId") == workspace_id:
+            return entry
+    return {}
+
+
+def get_linked_workspace_kr_sources(workspace):
+    settings = get_okr_app_settings(workspace)
+    objective_workspaces = settings.get("objectiveWorkspaces", {})
+    linked_workspaces = settings.get("linkedWorkspaces", {})
+
+    workspace_settings = find_workspace_settings_entry(
+        objective_workspaces,
+        workspace.get("id"),
+    )
+    linked_workspace_ids = workspace_settings.get("linkedWorkspaceIds", [])
+
+    sources = []
+    for linked_workspace_id in linked_workspace_ids:
+        linked_settings = find_workspace_settings_entry(
+            linked_workspaces,
+            linked_workspace_id,
+        )
+        reference_field_id = linked_settings.get("keyResultReferenceFieldId")
+        if linked_workspace_id and reference_field_id:
+            sources.append(
+                {
+                    "workspace_id": linked_workspace_id,
+                    "reference_field_id": reference_field_id,
+                }
+            )
+
+    if sources:
+        return sources
+
+    for linked_settings in normalize_settings_collection(linked_workspaces):
+        linked_workspace_id = linked_settings.get("workspaceId")
+        reference_field_id = linked_settings.get("keyResultReferenceFieldId")
+        if linked_workspace_id and reference_field_id:
+            sources.append(
+                {
+                    "workspace_id": linked_workspace_id,
+                    "reference_field_id": reference_field_id,
+                }
+            )
+    return sources
 
 
 def sanitize_filename_component(value):
@@ -394,13 +474,13 @@ def list_workspaces(config, workspace_ids):
     )
 
 
-def search_items(config, workspace_id, offset=0, limit=1000):
+def search_items(config, workspace_id, query=None, offset=0, limit=1000):
     params = {"offset": offset, "limit": limit}
     return api_request(
         config,
         "POST",
         f"/api/workspaces/{workspace_id}/items/search",
-        body={},
+        body=query or {},
         params=params,
     )
 
@@ -419,12 +499,12 @@ def search_fields(config, workspace_ids=None):
     return result.get("items", [])
 
 
-def paginated_search_items(config, workspace_id):
+def paginated_search_items(config, workspace_id, query=None):
     items = []
     offset = 0
     limit = 1000
     while True:
-        page = search_items(config, workspace_id, offset=offset, limit=limit)
+        page = search_items(config, workspace_id, query=query, offset=offset, limit=limit)
         batch = page.get("items", [])
         items.extend(batch)
         if len(batch) < limit:
@@ -448,33 +528,253 @@ def build_field_type_map(config, workspace_ids, cache):
     return field_map
 
 
+def collect_item_refs(value, default_workspace_id=None):
+    refs = []
+
+    def visit(current):
+        if current is None:
+            return
+        if isinstance(current, str):
+            refs.append(current)
+            return
+        if isinstance(current, list):
+            for item in current:
+                visit(item)
+            return
+        if not isinstance(current, dict):
+            return
+
+        if "itemIds" in current:
+            visit(current.get("itemIds"))
+        if "items" in current:
+            visit(current.get("items"))
+        if "value" in current and not any(
+            key in current for key in ("itemId", "workspaceId", "itemIds", "items")
+        ):
+            visit(current.get("value"))
+
+        item_id = current.get("itemId") or current.get("id")
+        workspace_id = current.get("workspaceId") or current.get("workspace", {}).get("id")
+        if item_id:
+            if workspace_id and workspace_id != default_workspace_id:
+                refs.append((workspace_id, item_id))
+            else:
+                refs.append(item_id)
+
+    visit(value)
+
+    unique_refs = []
+    seen = set()
+    for ref in refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        unique_refs.append(ref)
+    return unique_refs
+
+
+def collect_key_result_refs(value, default_workspace_id=None):
+    return collect_item_refs(value, default_workspace_id=default_workspace_id)
+
+
+def collect_objective_refs(value, default_workspace_id=None):
+    return collect_item_refs(value, default_workspace_id=default_workspace_id)
+
+
+def collect_key_result_entries(value):
+    entries = []
+
+    def visit(current):
+        if current is None:
+            return
+        if isinstance(current, list):
+            for item in current:
+                visit(item)
+            return
+        if not isinstance(current, dict):
+            return
+
+        if isinstance(current.get("keyResults"), list):
+            visit(current.get("keyResults"))
+        if isinstance(current.get("linkedItems"), list):
+            visit(current.get("linkedItems"))
+        if isinstance(current.get("items"), list):
+            visit(current.get("items"))
+        if "value" in current and not any(
+            key in current for key in ("id", "title", "keyResults", "items", "linkedItems")
+        ):
+            visit(current.get("value"))
+
+        if current.get("id") and current.get("title"):
+            entries.append(current)
+
+    visit(value)
+
+    unique_entries = []
+    seen_ids = set()
+    for entry in entries:
+        entry_id = entry.get("id")
+        if not entry_id or entry_id in seen_ids:
+            continue
+        seen_ids.add(entry_id)
+        unique_entries.append(entry)
+    return unique_entries
+
+
+def extract_confidence_value(value):
+    if not isinstance(value, dict):
+        return None
+    if value.get("value") is not None:
+        return value.get("value")
+    if value.get("confidence") is not None:
+        return value.get("confidence")
+    return None
+
+
+def extract_progress_value(value):
+    if not isinstance(value, dict):
+        return None
+    if value.get("percentage") is not None:
+        return value.get("percentage")
+    if value.get("value") is not None:
+        return value.get("value")
+    ratio = value.get("ratio")
+    if isinstance(ratio, (int, float)):
+        return int(round(ratio * 100))
+    return None
+
+
+def extract_time_period_value(value):
+    if not isinstance(value, dict):
+        return None
+    if "from" in value and "to" in value:
+        return f"{value['from']} - {value['to']}"
+    if value.get("periodId"):
+        return value.get("periodId")
+
+    date_range = value.get("dateRange")
+    if isinstance(date_range, dict):
+        start_date = date_range.get("startDate")
+        end_date = date_range.get("endDate")
+        if start_date and end_date:
+            return f"{start_date} - {end_date}"
+
+    time_period_ids = value.get("timePeriodIds")
+    if isinstance(time_period_ids, list) and time_period_ids:
+        return ", ".join(str(period_id) for period_id in time_period_ids)
+    return None
+
+
+def get_latest_checkin(key_result):
+    if not isinstance(key_result, dict):
+        return None
+    checkins = key_result.get("checkins", {})
+    entries = checkins.get("checkins") if isinstance(checkins, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return None
+
+    def sort_key(entry):
+        return entry.get("checkinAt") or entry.get("createdAt") or ""
+
+    return max((entry for entry in entries if isinstance(entry, dict)), key=sort_key, default=None)
+
+
+def get_key_result_row_values(key_result):
+    latest_checkin = get_latest_checkin(key_result)
+
+    confidence = extract_confidence_value(key_result.get("confidence"))
+    if confidence is None and latest_checkin:
+        confidence = extract_confidence_value(latest_checkin.get("confidence"))
+
+    progress = extract_progress_value(key_result.get("progress"))
+    if progress is None and latest_checkin:
+        progress = extract_progress_value(latest_checkin.get("progress"))
+
+    time_period = extract_time_period_value(key_result.get("timePeriod"))
+
+    return {
+        "confidence": confidence,
+        "progress": progress,
+        "time_period": time_period,
+    }
+
+
+def build_linked_key_result_map(config, workspace, objective_items, linked_workspace_item_cache):
+    sources = get_linked_workspace_kr_sources(workspace)
+    if not sources or not objective_items:
+        return {}
+
+    objective_ids = [item.get("id") for item in objective_items if item.get("id")]
+    if not objective_ids:
+        return {}
+
+    objective_id_set = set(objective_ids)
+    objective_workspace_id = workspace.get("id")
+    linked_krs_by_objective = {}
+
+    for source in sources:
+        linked_workspace_id = source["workspace_id"]
+        if linked_workspace_id not in linked_workspace_item_cache:
+            linked_workspace_item_cache[linked_workspace_id] = paginated_search_items(
+                config,
+                linked_workspace_id,
+            )
+
+        linked_items = linked_workspace_item_cache[linked_workspace_id]
+
+        for linked_item in linked_items:
+            fields = linked_item.get("fields", {})
+            refs = collect_objective_refs(
+                fields.get(source["reference_field_id"]),
+                default_workspace_id=objective_workspace_id,
+            )
+
+            matched_objective_ids = []
+            for ref in refs:
+                if isinstance(ref, tuple):
+                    ref_workspace_id, ref_item_id = ref
+                    if ref_workspace_id and ref_workspace_id != objective_workspace_id:
+                        continue
+                    objective_id = ref_item_id
+                else:
+                    objective_id = ref
+
+                if objective_id in objective_id_set and objective_id not in matched_objective_ids:
+                    matched_objective_ids.append(objective_id)
+
+            for objective_id in matched_objective_ids:
+                linked_krs_by_objective.setdefault(objective_id, []).append(linked_item)
+
+    return linked_krs_by_objective
+
+
 def extract_item_okr_fields(item, field_map):
     result = {
         "kr_ids": [],
+        "kr_entries": [],
         "confidence": None,
         "progress": None,
         "time_period": None,
     }
+    default_workspace_id = item.get("workspaceId")
     fields = item.get("fields", {})
     for field_id, value in fields.items():
         ftype = field_map.get(field_id)
         if ftype == FIELD_OKR_KEY_RESULTS:
-            ids = value.get("itemIds", [])
-            result["kr_ids"].extend(ids)
+            result["kr_entries"].extend(collect_key_result_entries(value))
+            result["kr_ids"].extend(
+                collect_key_result_refs(value, default_workspace_id=default_workspace_id)
+            )
         elif ftype == FIELD_OKR_KEY_RESULT_REF:
-            wid = value.get("workspaceId")
-            iid = value.get("itemId")
-            if iid:
-                result["kr_ids"].append((wid, iid))
+            result["kr_ids"].extend(
+                collect_key_result_refs(value, default_workspace_id=default_workspace_id)
+            )
         elif ftype == FIELD_OKR_CONFIDENCE:
-            result["confidence"] = value.get("value")
+            result["confidence"] = extract_confidence_value(value)
         elif ftype == FIELD_OKR_PROGRESS:
-            result["progress"] = value.get("percentage")
+            result["progress"] = extract_progress_value(value)
         elif ftype == FIELD_OKR_TIME_PERIOD:
-            if "from" in value and "to" in value:
-                result["time_period"] = f"{value['from']} - {value['to']}"
-            elif "periodId" in value:
-                result["time_period"] = value["periodId"]
+            result["time_period"] = extract_time_period_value(value)
     return result
 
 
@@ -566,6 +866,29 @@ def get_item_alias(item):
     return str(number) if number is not None else item["id"]
 
 
+def get_key_result_label(key_result):
+    if not isinstance(key_result, dict):
+        return str(key_result or "")
+
+    embedded = key_result.get("_embedded")
+    if isinstance(embedded, dict) or "number" in key_result:
+        return get_item_alias(key_result)
+
+    alias = key_result.get("alias")
+    if alias:
+        return alias
+
+    title = key_result.get("title")
+    if title:
+        return title
+
+    name = key_result.get("name")
+    if name:
+        return name
+
+    return key_result.get("id", "")
+
+
 def flatten_paths(
     config,
     workspace_node,
@@ -573,6 +896,7 @@ def flatten_paths(
     ancestor_ctx=None,
     field_map_cache=None,
     resolved_item_cache=None,
+    linked_workspace_item_cache=None,
 ):
     if ancestor_ctx is None:
         ancestor_ctx = []
@@ -580,6 +904,8 @@ def flatten_paths(
         field_map_cache = {}
     if resolved_item_cache is None:
         resolved_item_cache = {}
+    if linked_workspace_item_cache is None:
+        linked_workspace_item_cache = {}
 
     ws = workspace_node["workspace"]
     ws_name = ws.get("name", "")
@@ -591,8 +917,8 @@ def flatten_paths(
     current_ctx = ancestor_ctx + [
         {
             "ws_name": ws_name,
-            "item_name": None,
-            "child_name": None,
+            "objective_name": None,
+            "child_objective_name": None,
             "kr_alias": None,
             "status": None,
             "confidence": None,
@@ -601,40 +927,60 @@ def flatten_paths(
         }
     ]
 
+    linked_krs_by_objective = build_linked_key_result_map(
+        config,
+        ws,
+        items,
+        linked_workspace_item_cache,
+    )
+
     item_kr_list = []
     for item in items:
         okr = extract_item_okr_fields(item, field_map)
 
         kr_ids = okr["kr_ids"]
-        if kr_ids:
+        direct_krs = list(okr["kr_entries"])
+        if kr_ids or direct_krs:
             local_ids = [i for i in kr_ids if isinstance(i, str)]
             cross_ws = [i for i in kr_ids if isinstance(i, tuple)]
 
-            resolved_krs = []
-            if local_ids:
+            resolved_krs = list(direct_krs)
+            if local_ids and not direct_krs:
                 resolved_krs.extend(
                     resolve_items(config, ws["id"], local_ids, resolved_item_cache)
                 )
-            for rws_id, ritem_id in cross_ws:
-                if not rws_id:
+            if not direct_krs:
+                for rws_id, ritem_id in cross_ws:
+                    if not rws_id:
+                        continue
+                    ritems = resolve_items(
+                        config, rws_id, [ritem_id], resolved_item_cache
+                    )
+                    resolved_krs.extend(ritems)
+
+            for linked_kr in linked_krs_by_objective.get(item["id"], []):
+                linked_kr_id = linked_kr.get("id")
+                if linked_kr_id and any(
+                    resolved_kr.get("id") == linked_kr_id
+                    for resolved_kr in resolved_krs
+                    if isinstance(resolved_kr, dict)
+                ):
                     continue
-                ritems = resolve_items(
-                    config, rws_id, [ritem_id], resolved_item_cache
-                )
-                resolved_krs.extend(ritems)
+                resolved_krs.append(linked_kr)
 
             if resolved_krs:
                 for kr in resolved_krs:
-                    kr_alias = get_item_alias(kr)
+                    kr_alias = get_key_result_label(kr)
+                    kr_values = get_key_result_row_values(kr)
                     item_kr_list.append(
                         {
                             "item": item,
                             "child_item": None,
                             "kr_alias": kr_alias,
                             "status": "",
-                            "confidence": okr["confidence"],
-                            "progress": okr["progress"],
-                            "time_period": okr["time_period"],
+                            "confidence": kr_values["confidence"] if kr_values["confidence"] is not None else okr["confidence"],
+                            "progress": kr_values["progress"] if kr_values["progress"] is not None else okr["progress"],
+                            "time_period": kr_values["time_period"] or okr["time_period"],
                         }
                     )
             else:
@@ -650,6 +996,23 @@ def flatten_paths(
                     }
                 )
         else:
+            linked_krs = linked_krs_by_objective.get(item["id"], [])
+            if linked_krs:
+                for kr in linked_krs:
+                    kr_values = get_key_result_row_values(kr)
+                    item_kr_list.append(
+                        {
+                            "item": item,
+                            "child_item": None,
+                            "kr_alias": get_key_result_label(kr),
+                            "status": "",
+                            "confidence": kr_values["confidence"] if kr_values["confidence"] is not None else okr["confidence"],
+                            "progress": kr_values["progress"] if kr_values["progress"] is not None else okr["progress"],
+                            "time_period": kr_values["time_period"] or okr["time_period"],
+                        }
+                    )
+                continue
+
             item_kr_list.append(
                 {
                     "item": item,
@@ -685,21 +1048,22 @@ def flatten_paths(
         pid = parent_ik["item"]["id"]
         children_ik = child_map.get(pid, [])
 
-        if not children_ik:
+        if parent_ik["kr_alias"] is not None or not children_ik:
             ctx_entry = current_ctx_level.copy()
-            ctx_entry["item_name"] = parent_ik["item"].get("name", "")
-            ctx_entry["child_name"] = None
+            ctx_entry["objective_name"] = parent_ik["item"].get("name", "")
+            ctx_entry["child_objective_name"] = None
             ctx_entry["kr_alias"] = parent_ik["kr_alias"]
             ctx_entry["status"] = parent_ik["status"]
             ctx_entry["confidence"] = parent_ik["confidence"]
             ctx_entry["progress"] = parent_ik["progress"]
             ctx_entry["time_period"] = parent_ik["time_period"]
             yield list(current_ctx[:-1]) + [ctx_entry]
-        else:
+
+        if children_ik:
             for child_ik in children_ik:
                 ctx_entry = current_ctx_level.copy()
-                ctx_entry["item_name"] = parent_ik["item"].get("name", "")
-                ctx_entry["child_name"] = child_ik["item"].get("name", "")
+                ctx_entry["objective_name"] = parent_ik["item"].get("name", "")
+                ctx_entry["child_objective_name"] = child_ik["item"].get("name", "")
                 ctx_entry["kr_alias"] = child_ik["kr_alias"]
                 ctx_entry["status"] = child_ik["status"]
                 ctx_entry["confidence"] = child_ik["confidence"]
@@ -723,20 +1087,27 @@ def flatten_paths(
                 current_ctx,
                 field_map_cache,
                 resolved_item_cache,
+                linked_workspace_item_cache,
             )
 
 
 def write_csv(rows, outfile):
     max_depth = max(len(r) for r in rows) if rows else 0
 
+    def get_level_prefix(depth):
+        if depth == 0:
+            return "Parent"
+        return "Child0" + "-0" * (depth - 1)
+
     fieldnames = []
     for i in range(max_depth):
+        prefix = get_level_prefix(i)
         fieldnames.extend(
             [
-                f"Parent{i}",
-                f"Parent{i}_Item",
-                f"Parent{i}_ChildItem",
-                f"Parent{i}_KeyResult",
+                prefix,
+                f"{prefix}_Objective",
+                f"{prefix}_ChildObjective",
+                f"{prefix}_KeyResult",
             ]
         )
     fieldnames.extend(["Status", "Confidence", "Progress", "TimePeriod"])
@@ -747,10 +1118,11 @@ def write_csv(rows, outfile):
     for row in rows:
         csv_row = {}
         for i, level in enumerate(row):
-            csv_row[f"Parent{i}"] = level.get("ws_name", "")
-            csv_row[f"Parent{i}_Item"] = level.get("item_name") or ""
-            csv_row[f"Parent{i}_ChildItem"] = level.get("child_name") or ""
-            csv_row[f"Parent{i}_KeyResult"] = level.get("kr_alias") or ""
+            prefix = get_level_prefix(i)
+            csv_row[prefix] = level.get("ws_name", "")
+            csv_row[f"{prefix}_Objective"] = level.get("objective_name") or ""
+            csv_row[f"{prefix}_ChildObjective"] = level.get("child_objective_name") or ""
+            csv_row[f"{prefix}_KeyResult"] = level.get("kr_alias") or ""
 
         last = row[-1] if row else {}
         csv_row["Status"] = last.get("status") or ""
