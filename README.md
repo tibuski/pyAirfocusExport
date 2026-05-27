@@ -1,6 +1,6 @@
 # pyAirfocusExport
 
-Export airfocus OKR workspaces with hierarchy and key results to CSV.
+Export airfocus OKR workspaces to reporting-friendly CSV and JSON files.
 
 ## Usage
 
@@ -44,20 +44,70 @@ If airfocus support asks you to temporarily restore legacy filter behavior, set 
 
 Python standard library only. No third-party packages.
 
-## CSV Output
+## Output Files
 
-Dynamic columns per hierarchy depth use `Parent` for the top level, then child-style prefixes such as `Child0`, `Child0-0`, `Child0-0-0`.
+Running with `--parent` now writes five files to `Output/` with the same timestamped prefix:
+
+- `[date-time]-[parent-name].csv` — legacy flat path export, kept for spreadsheet-style review
+- `[date-time]-[parent-name]-nodes.csv` — normalized reporting export with one row per workspace, objective, child objective, or key result
+- `[date-time]-[parent-name]-edges.csv` — explicit hierarchy edges between workspaces, objectives, child objectives, and key results
+- `[date-time]-[parent-name]-management.csv` — management-friendly flat export for Excel-style filtering, sorting, and pivoting
+- `[date-time]-[parent-name].json` — hierarchical JSON export for AI-assisted graphics and nested consumers
+
+Use `nodes` and `edges` for BI/reporting, `management.csv` for spreadsheet-oriented consumption, and the JSON export for AI or tools that prefer nested data.
+
+### Nodes CSV
 
 | Column | Description |
 |---|---|
-| `Parent` / `Child...` | Objective workspace name for that hierarchy level |
-| `Parent_Objective` / `Child..._Objective` | Objective name |
-| `Parent_ChildObjective` / `Child..._ChildObjective` | Child objective (within same workspace) |
-| `Parent_KeyResult` / `Child..._KeyResult` | Key result alias when available, otherwise the key result title |
-| `Status` | Empty placeholder column; workspace status metadata is not queried |
+| `Id` | Stable export node identifier with a type prefix such as `workspace:`, `item:`, or `kr:` |
+| `NodeType` | `workspace`, `objective`, or `key_result` |
+| `HierarchyRole` | `workspace`, `objective`, `child_objective`, or `key_result` |
+| `WorkspaceId` | Owning workspace UUID |
+| `WorkspaceName` | Owning workspace name |
+| `Title` | Entity title or name |
+| `Alias` | Workspace alias or objective/key result alias when available |
+| `StatusId` | airfocus status UUID when present in the payload |
 | `Confidence` | OKR confidence (high/medium/low) |
-| `Progress` | Progress percentage |
+| `Progress` | Progress value from the OKR payload |
 | `TimePeriod` | OKR time period |
+| `CreatedAt` | Entity creation timestamp when present |
+| `UpdatedAt` | Entity update timestamp when present |
+| `Archived` | `true` / `false` when present |
+| `AssigneeUserIds` | Comma-separated assignee user IDs |
+
+### Edges CSV
+
+| Column | Description |
+|---|---|
+| `SourceId` | Parent node ID |
+| `TargetId` | Child node ID |
+| `RelationType` | `workspace_child`, `workspace_objective`, `objective_child`, or `objective_key_result` |
+| `WorkspaceId` | Workspace UUID where the relation was discovered |
+| `WorkspaceName` | Workspace name where the relation was discovered |
+
+### Management CSV
+
+| Column | Description |
+|---|---|
+| `Workspace` | Workspace name |
+| `Objective` | Objective name |
+| `ChildObjective` | Child objective name when applicable |
+| `KeyResult` | Key result title when applicable |
+| `Level` | Hierarchy role (`objective`, `child_objective`, `key_result`) |
+| `NodeType` | Export row type for spreadsheet filtering |
+| `StatusId` | airfocus status UUID when present in the payload |
+| `Confidence` | OKR confidence |
+| `Progress` | Progress value |
+| `TimePeriod` | OKR time period |
+
+### JSON Export
+
+The JSON export writes the same hierarchy as a nested structure rooted at workspaces. It is intended for AI-assisted graphics generation and tools that prefer explicit nested children over CSV joins.
+
+### Legacy Path CSV
+
+The legacy path CSV remains available for manual review. It keeps the previous dynamic `Parent` / `Child...` columns and still outputs one row per workspace → objective → child objective → key result path.
 
 ## API
 
@@ -70,7 +120,7 @@ Dynamic columns per hierarchy depth use `Parent` for the top level, then child-s
 ## Runtime behavior
 
 - Running without `--parent` lists the accessible objective workspace hierarchy from workspace metadata and exits
-- Running with `--parent` writes a CSV file named `Output\[date-time]-[parent-name].csv`
+- Running with `--parent` writes five files: legacy path CSV, normalized `-nodes.csv`, normalized `-edges.csv`, management-friendly `-management.csv`, and hierarchical `.json`
 - Logs progress and API errors to stderr
 - Paginates workspace items with a page size of 1000
 - Resolves key results from objective OKR fields and from linked workspace items that reference those objectives

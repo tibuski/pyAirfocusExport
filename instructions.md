@@ -10,18 +10,20 @@
 
 # Project Goal
 
-* Main goal is to export objective workspaces with hierarchy and corresponding key results for each level of objective workspace.
-* The result should be a .csv file that will be used to create graphics and reports.
+* Main goal is to export objective workspaces with hierarchy and corresponding key results in reporting-friendly CSV and JSON shapes.
+* The result should support graphics, reporting, spreadsheet analysis, and AI-assisted visualization without requiring additional API queries per output file.
 * Running `uv run pyAirfocusExport.py` without arguments should list the accessible objective workspace hierarchy.
 * Export usage is `uv run pyAirfocusExport.py --parent "Objective Workspace Name"`
 * `--parent` accepts either the full workspace name or the workspace short name / alias.
-* By default, exporting with `--parent` writes `Output\[date-time]-[parent-name].csv`.
+* By default, exporting with `--parent` writes five files under `Output/`: a legacy path CSV, normalized `-nodes.csv`, normalized `-edges.csv`, a management-friendly `-management.csv`, and a hierarchical `.json` file.
 
 # Implementation Plan
 
 ## CSV Output Columns
 
-Columns are generated dynamically based on the hierarchy depth. The hierarchy is:
+The primary reporting output is normalized into `nodes` and `edges` CSV files. A spreadsheet-friendly `management.csv` and a hierarchical JSON export are also written from the same in-memory model. The legacy flat path CSV is still written for manual review.
+
+The hierarchy represented by the normalized export is:
 
 ```
 Objective Workspace (e.g., Company OKRs)
@@ -36,9 +38,58 @@ Objective Workspace (e.g., Company OKRs)
               └── Key Results (Child0_KeyResult)
 ```
 
-Each row represents a path through the hierarchy: workspace → objective → child objective → key result.
+Each `nodes.csv` row represents exactly one entity. Each `edges.csv` row represents one hierarchy relationship.
 
-### Dynamic Path Columns
+### Nodes CSV
+
+| Column | Description |
+|---|---|
+| `Id` | Stable node identifier prefixed by entity type (`workspace:`, `item:`, `kr:`) |
+| `NodeType` | `workspace`, `objective`, or `key_result` |
+| `HierarchyRole` | `workspace`, `objective`, `child_objective`, or `key_result` |
+| `WorkspaceId` | Owning workspace UUID |
+| `WorkspaceName` | Owning workspace name |
+| `Title` | Entity title or name |
+| `Alias` | Workspace alias or item/key result alias when available |
+| `StatusId` | airfocus status UUID when available in the payload |
+| `Confidence` | OKR confidence level |
+| `Progress` | Progress value |
+| `TimePeriod` | OKR time period |
+| `CreatedAt` | Creation timestamp when available |
+| `UpdatedAt` | Update timestamp when available |
+| `Archived` | `true` / `false` when available |
+| `AssigneeUserIds` | Comma-separated assignee user IDs |
+
+### Edges CSV
+
+| Column | Description |
+|---|---|
+| `SourceId` | Parent node ID |
+| `TargetId` | Child node ID |
+| `RelationType` | `workspace_child`, `workspace_objective`, `objective_child`, or `objective_key_result` |
+| `WorkspaceId` | Workspace UUID where the edge was discovered |
+| `WorkspaceName` | Workspace name where the edge was discovered |
+
+### Management CSV
+
+| Column | Description |
+|---|---|
+| `Workspace` | Workspace name |
+| `Objective` | Objective name |
+| `ChildObjective` | Child objective name when applicable |
+| `KeyResult` | Key result title when applicable |
+| `Level` | Hierarchy role (`objective`, `child_objective`, `key_result`) |
+| `NodeType` | Export row type |
+| `StatusId` | airfocus status UUID when available in the payload |
+| `Confidence` | OKR confidence |
+| `Progress` | Progress value |
+| `TimePeriod` | OKR time period |
+
+### JSON Export
+
+The JSON export mirrors the workspace → objective → child objective → key result hierarchy as nested objects. It is intended for AI-assisted graphics generation and other consumers that work better with explicit nested children than with joined CSV files.
+
+### Legacy Path Columns
 
 The top-level workspace columns use `Parent`. Deeper workspace levels use child prefixes such as `Child0`, `Child0-0`, `Child0-0-0`.
 
@@ -57,7 +108,7 @@ Example for a 2-level hierarchy: `Parent`, `Parent_Objective`, `Parent_ChildObje
 
 | Column | Description |
 |---|---|
-| `Status` | Empty placeholder column; workspace status metadata is not queried |
+| `Status` | Empty placeholder column kept for backward compatibility |
 | `Confidence` | OKR confidence level (high/medium/low) |
 | `Progress` | Progress percentage |
 | `TimePeriod` | OKR time period |
@@ -145,7 +196,7 @@ Use `Content-Type: application/json` and accept `application/json` (or `applicat
 
 4. **Build workspace hierarchy** — Recursively traverse from the parent workspace using workspace metadata:
       - Load accessible OKR workspaces and derive parent/child workspace links from `_embedded.parents`, `_embedded.children`, and OKR app hierarchy settings.
-      - Start from the selected parent workspace and recurse through its child objective workspaces. These become `Parent1`, `Parent2`, etc.
+      - Start from the selected parent workspace and recurse through its child objective workspaces.
       - For each workspace in that tree, fetch its items via `POST /api/workspaces/{id}/items/search`.
 
 5. **Extract items and key results** — For each workspace in the hierarchy:
@@ -157,7 +208,12 @@ Use `Content-Type: application/json` and accept `application/json` (or `applicat
 
 6. **Build parent-child relationships** — Use `_embedded.parents` and `_embedded.children` on each item to reconstruct the hierarchy.
 
-7. **Write CSV** — Build the column list dynamically based on max hierarchy depth. For each path from the parent workspace to a leaf, output one row per key result at each level. Use `csv.DictWriter`.
+7. **Write export files**
+      - Build `nodes.csv` with one row per workspace, objective, child objective, and key result.
+      - Build `edges.csv` with explicit parent-child links between workspaces, objectives, child objectives, and key results.
+      - Build `management.csv` for spreadsheet-oriented filtering and pivoting.
+      - Build hierarchical `.json` from the same in-memory export model for AI and nested consumers.
+      - Also write the legacy path CSV for manual review and backward compatibility.
 
 ## Error Handling
 
@@ -167,7 +223,7 @@ Use `Content-Type: application/json` and accept `application/json` (or `applicat
 - If TLS interception breaks certificate validation, allow `ignore_ssl_cert_check = True` in `config.py`.
 - Paginate results (max 1000 per page) to handle large workspaces.
 - Handle HTTP errors (401 = bad API key, 403 = insufficient permissions, 429 = rate limit).
-- Log progress to stderr (e.g., "Fetching workspace X...", "Fetching items...") so the CSV on stdout/stderr is clean.
+- Log progress to stderr (e.g., "Fetching workspace X...", "Fetching items...") so generated files remain the only structured output.
 
 ## Dependencies
 

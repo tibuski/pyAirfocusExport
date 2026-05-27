@@ -276,6 +276,18 @@ def get_default_output_path(workspace):
     return os.path.join(os.getcwd(), "Output", f"{timestamp}-{safe_name}.csv")
 
 
+def get_output_paths(workspace):
+    legacy_path = get_default_output_path(workspace)
+    prefix, _ = os.path.splitext(legacy_path)
+    return {
+        "paths": legacy_path,
+        "nodes": f"{prefix}-nodes.csv",
+        "edges": f"{prefix}-edges.csv",
+        "management": f"{prefix}-management.csv",
+        "json": f"{prefix}.json",
+    }
+
+
 def sort_workspaces(workspaces):
     return sorted(workspaces, key=lambda ws: ws.get("name", "").lower())
 
@@ -1044,37 +1056,45 @@ def flatten_paths(
         for pid in parent_ids:
             child_map.setdefault(pid, []).append(ik)
 
-    def build_kr_paths(parent_ik, current_ctx_level):
-        pid = parent_ik["item"]["id"]
-        children_ik = child_map.get(pid, [])
+    def build_kr_paths(root_ik, current_ik, current_ctx_level, child_objective_path=None, visited=None):
+        if child_objective_path is None:
+            child_objective_path = []
+        if visited is None:
+            visited = set()
 
-        if parent_ik["kr_alias"] is not None or not children_ik:
+        current_id = current_ik["item"]["id"]
+        if current_id in visited:
+            return
+
+        children_ik = child_map.get(current_id, [])
+
+        if current_ik["kr_alias"] is not None or not children_ik:
             ctx_entry = current_ctx_level.copy()
-            ctx_entry["objective_name"] = parent_ik["item"].get("name", "")
-            ctx_entry["child_objective_name"] = None
-            ctx_entry["kr_alias"] = parent_ik["kr_alias"]
-            ctx_entry["status"] = parent_ik["status"]
-            ctx_entry["confidence"] = parent_ik["confidence"]
-            ctx_entry["progress"] = parent_ik["progress"]
-            ctx_entry["time_period"] = parent_ik["time_period"]
+            ctx_entry["objective_name"] = root_ik["item"].get("name", "")
+            ctx_entry["child_objective_name"] = " > ".join(child_objective_path) or None
+            ctx_entry["kr_alias"] = current_ik["kr_alias"]
+            ctx_entry["status"] = current_ik["status"]
+            ctx_entry["confidence"] = current_ik["confidence"]
+            ctx_entry["progress"] = current_ik["progress"]
+            ctx_entry["time_period"] = current_ik["time_period"]
             yield list(current_ctx[:-1]) + [ctx_entry]
 
         if children_ik:
+            next_visited = visited | {current_id}
             for child_ik in children_ik:
-                ctx_entry = current_ctx_level.copy()
-                ctx_entry["objective_name"] = parent_ik["item"].get("name", "")
-                ctx_entry["child_objective_name"] = child_ik["item"].get("name", "")
-                ctx_entry["kr_alias"] = child_ik["kr_alias"]
-                ctx_entry["status"] = child_ik["status"]
-                ctx_entry["confidence"] = child_ik["confidence"]
-                ctx_entry["progress"] = child_ik["progress"]
-                ctx_entry["time_period"] = child_ik["time_period"]
-                yield list(current_ctx[:-1]) + [ctx_entry]
+                child_name = child_ik["item"].get("name", "")
+                yield from build_kr_paths(
+                    root_ik,
+                    child_ik,
+                    current_ctx_level,
+                    child_objective_path + [child_name],
+                    next_visited,
+                )
 
     ctx_level = current_ctx[-1]
     if top_level:
         for tl_item_kr in top_level:
-            yield from build_kr_paths(tl_item_kr, ctx_level)
+            yield from build_kr_paths(tl_item_kr, tl_item_kr, ctx_level)
     else:
         yield list(current_ctx[:-1]) + [ctx_level]
 
@@ -1091,7 +1111,494 @@ def flatten_paths(
             )
 
 
-def write_csv(rows, outfile):
+def add_unique_row(rows, seen_keys, key, row):
+    if key in seen_keys:
+        return
+    seen_keys.add(key)
+    rows.append(row)
+
+
+def get_same_workspace_parent_ids(item, workspace_id):
+    parents = item.get("_embedded", {}).get("parents", [])
+    return [
+        parent.get("itemId")
+        for parent in parents
+        if parent.get("workspaceId") == workspace_id and parent.get("itemId")
+    ]
+
+
+def resolve_item_key_results(
+    config,
+    workspace,
+    item,
+    field_map,
+    linked_krs_by_objective,
+    resolved_item_cache,
+):
+    okr = extract_item_okr_fields(item, field_map)
+
+    kr_ids = okr["kr_ids"]
+    direct_krs = list(okr["kr_entries"])
+    local_ids = [ref for ref in kr_ids if isinstance(ref, str)]
+    cross_workspace_refs = [ref for ref in kr_ids if isinstance(ref, tuple)]
+
+    resolved_krs = list(direct_krs)
+    if local_ids and not direct_krs:
+        resolved_krs.extend(resolve_items(config, workspace["id"], local_ids, resolved_item_cache))
+
+    if not direct_krs:
+        for ref_workspace_id, ref_item_id in cross_workspace_refs:
+            if not ref_workspace_id:
+                continue
+            resolved_krs.extend(
+                resolve_items(config, ref_workspace_id, [ref_item_id], resolved_item_cache)
+            )
+
+    for linked_kr in linked_krs_by_objective.get(item["id"], []):
+        linked_kr_id = linked_kr.get("id")
+        if linked_kr_id and any(
+            isinstance(resolved_kr, dict) and resolved_kr.get("id") == linked_kr_id
+            for resolved_kr in resolved_krs
+        ):
+            continue
+        resolved_krs.append(linked_kr)
+
+    return okr, resolved_krs
+
+
+def build_reporting_rows(
+    config,
+    workspace_node,
+    parent_workspace_node_id=None,
+    field_map_cache=None,
+    resolved_item_cache=None,
+    linked_workspace_item_cache=None,
+    nodes=None,
+    node_keys=None,
+    edges=None,
+    edge_keys=None,
+):
+    if field_map_cache is None:
+        field_map_cache = {}
+    if resolved_item_cache is None:
+        resolved_item_cache = {}
+    if linked_workspace_item_cache is None:
+        linked_workspace_item_cache = {}
+    if nodes is None:
+        nodes = []
+    if node_keys is None:
+        node_keys = set()
+    if edges is None:
+        edges = []
+    if edge_keys is None:
+        edge_keys = set()
+
+    workspace = workspace_node["workspace"]
+    workspace_id = workspace["id"]
+    workspace_name = workspace.get("name", "")
+    workspace_node_id = f"workspace:{workspace_id}"
+
+    add_unique_row(
+        nodes,
+        node_keys,
+        workspace_node_id,
+        {
+            "Id": workspace_node_id,
+            "NodeType": "workspace",
+            "HierarchyRole": "workspace",
+            "WorkspaceId": workspace_id,
+            "WorkspaceName": workspace_name,
+            "Title": workspace_name,
+            "Alias": workspace.get("alias") or "",
+            "StatusId": "",
+            "Confidence": "",
+            "Progress": "",
+            "TimePeriod": "",
+            "CreatedAt": "",
+            "UpdatedAt": "",
+            "Archived": "",
+            "AssigneeUserIds": "",
+        },
+    )
+
+    if parent_workspace_node_id:
+        edge_key = (parent_workspace_node_id, workspace_node_id, "workspace_child")
+        add_unique_row(
+            edges,
+            edge_keys,
+            edge_key,
+            {
+                "SourceId": parent_workspace_node_id,
+                "TargetId": workspace_node_id,
+                "RelationType": "workspace_child",
+                "WorkspaceId": workspace_id,
+                "WorkspaceName": workspace_name,
+            },
+        )
+
+    items = workspace_node["items"]
+    item_ids = {item.get("id") for item in items if item.get("id")}
+    field_map = build_field_type_map(config, [workspace_id], field_map_cache)
+    linked_krs_by_objective = build_linked_key_result_map(
+        config,
+        workspace,
+        items,
+        linked_workspace_item_cache,
+    )
+
+    for item in items:
+        item_id = item.get("id")
+        if not item_id:
+            continue
+
+        parent_item_ids = [
+            parent_id
+            for parent_id in get_same_workspace_parent_ids(item, workspace_id)
+            if parent_id in item_ids
+        ]
+        okr, resolved_krs = resolve_item_key_results(
+            config,
+            workspace,
+            item,
+            field_map,
+            linked_krs_by_objective,
+            resolved_item_cache,
+        )
+
+        objective_node_id = f"item:{item_id}"
+        hierarchy_role = "child_objective" if parent_item_ids else "objective"
+        add_unique_row(
+            nodes,
+            node_keys,
+            objective_node_id,
+            {
+                "Id": objective_node_id,
+                "NodeType": "objective",
+                "HierarchyRole": hierarchy_role,
+                "WorkspaceId": workspace_id,
+                "WorkspaceName": workspace_name,
+                "Title": item.get("name") or "",
+                "Alias": get_item_alias(item),
+                "StatusId": item.get("statusId") or "",
+                "Confidence": okr.get("confidence") or "",
+                "Progress": okr.get("progress") if okr.get("progress") is not None else "",
+                "TimePeriod": okr.get("time_period") or "",
+                "CreatedAt": item.get("createdAt") or "",
+                "UpdatedAt": item.get("lastUpdatedAt") or "",
+                "Archived": str(bool(item.get("archived"))).lower(),
+                "AssigneeUserIds": ",".join(item.get("assigneeUserIds", [])),
+            },
+        )
+
+        if parent_item_ids:
+            for parent_item_id in parent_item_ids:
+                edge_key = (f"item:{parent_item_id}", objective_node_id, "objective_child")
+                add_unique_row(
+                    edges,
+                    edge_keys,
+                    edge_key,
+                    {
+                        "SourceId": f"item:{parent_item_id}",
+                        "TargetId": objective_node_id,
+                        "RelationType": "objective_child",
+                        "WorkspaceId": workspace_id,
+                        "WorkspaceName": workspace_name,
+                    },
+                )
+        else:
+            edge_key = (workspace_node_id, objective_node_id, "workspace_objective")
+            add_unique_row(
+                edges,
+                edge_keys,
+                edge_key,
+                {
+                    "SourceId": workspace_node_id,
+                    "TargetId": objective_node_id,
+                    "RelationType": "workspace_objective",
+                    "WorkspaceId": workspace_id,
+                    "WorkspaceName": workspace_name,
+                },
+            )
+
+        for key_result in resolved_krs:
+            if not isinstance(key_result, dict):
+                continue
+
+            key_result_raw_id = key_result.get("id") or f"{item_id}:{get_key_result_label(key_result)}"
+            key_result_node_id = f"kr:{key_result_raw_id}"
+            key_result_values = get_key_result_row_values(key_result)
+            key_result_workspace_id = key_result.get("workspaceId") or workspace_id
+            key_result_workspace_name = workspace_name
+
+            add_unique_row(
+                nodes,
+                node_keys,
+                key_result_node_id,
+                {
+                    "Id": key_result_node_id,
+                    "NodeType": "key_result",
+                    "HierarchyRole": "key_result",
+                    "WorkspaceId": key_result_workspace_id,
+                    "WorkspaceName": key_result_workspace_name,
+                    "Title": key_result.get("title") or key_result.get("name") or get_key_result_label(key_result),
+                    "Alias": get_key_result_label(key_result),
+                    "StatusId": key_result.get("statusId") or "",
+                    "Confidence": key_result_values.get("confidence") or "",
+                    "Progress": key_result_values.get("progress") if key_result_values.get("progress") is not None else "",
+                    "TimePeriod": key_result_values.get("time_period") or "",
+                    "CreatedAt": key_result.get("createdAt") or "",
+                    "UpdatedAt": key_result.get("updatedAt") or "",
+                    "Archived": str(bool(key_result.get("archived"))).lower(),
+                    "AssigneeUserIds": ",".join(key_result.get("assigneeUserIds", [])),
+                },
+            )
+
+            edge_key = (objective_node_id, key_result_node_id, "objective_key_result")
+            add_unique_row(
+                edges,
+                edge_keys,
+                edge_key,
+                {
+                    "SourceId": objective_node_id,
+                    "TargetId": key_result_node_id,
+                    "RelationType": "objective_key_result",
+                    "WorkspaceId": workspace_id,
+                    "WorkspaceName": workspace_name,
+                },
+            )
+
+    for child_workspace in workspace_node["children"]:
+        build_reporting_rows(
+            config,
+            child_workspace,
+            parent_workspace_node_id=workspace_node_id,
+            field_map_cache=field_map_cache,
+            resolved_item_cache=resolved_item_cache,
+            linked_workspace_item_cache=linked_workspace_item_cache,
+            nodes=nodes,
+            node_keys=node_keys,
+            edges=edges,
+            edge_keys=edge_keys,
+        )
+
+    return nodes, edges
+
+
+def write_reporting_nodes_csv(rows, outfile):
+    fieldnames = [
+        "Id",
+        "NodeType",
+        "HierarchyRole",
+        "WorkspaceId",
+        "WorkspaceName",
+        "Title",
+        "Alias",
+        "StatusId",
+        "Confidence",
+        "Progress",
+        "TimePeriod",
+        "CreatedAt",
+        "UpdatedAt",
+        "Archived",
+        "AssigneeUserIds",
+    ]
+    writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+
+
+def write_reporting_edges_csv(rows, outfile):
+    fieldnames = [
+        "SourceId",
+        "TargetId",
+        "RelationType",
+        "WorkspaceId",
+        "WorkspaceName",
+    ]
+    writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+
+
+def build_management_rows(nodes, edges):
+    node_by_id = {node["Id"]: node for node in nodes}
+    objective_children = {}
+    objective_key_results = {}
+
+    for edge in edges:
+        relation_type = edge["RelationType"]
+        source_id = edge["SourceId"]
+        target_id = edge["TargetId"]
+        if relation_type == "objective_child":
+            objective_children.setdefault(source_id, []).append(target_id)
+        elif relation_type == "objective_key_result":
+            objective_key_results.setdefault(source_id, []).append(target_id)
+
+    rows = []
+    seen_keys = set()
+
+    def add_row(key, row):
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        rows.append(row)
+
+    for node in nodes:
+        if node["NodeType"] != "objective":
+            continue
+
+        objective_id = node["Id"]
+        child_ids = objective_children.get(objective_id, [])
+        key_result_ids = objective_key_results.get(objective_id, [])
+
+        add_row(
+            (objective_id, "objective", ""),
+            {
+                "Workspace": node["WorkspaceName"],
+                "Objective": node["Title"],
+                "ChildObjective": "",
+                "KeyResult": "",
+                "Level": node["HierarchyRole"],
+                "NodeType": "objective",
+                "StatusId": node["StatusId"],
+                "Confidence": node["Confidence"],
+                "Progress": node["Progress"],
+                "TimePeriod": node["TimePeriod"],
+            },
+        )
+
+        for child_id in child_ids:
+            child = node_by_id.get(child_id)
+            if not child:
+                continue
+            add_row(
+                (objective_id, "child_objective", child_id),
+                {
+                    "Workspace": child["WorkspaceName"],
+                    "Objective": node["Title"],
+                    "ChildObjective": child["Title"],
+                    "KeyResult": "",
+                    "Level": child["HierarchyRole"],
+                    "NodeType": "child_objective",
+                    "StatusId": child["StatusId"],
+                    "Confidence": child["Confidence"],
+                    "Progress": child["Progress"],
+                    "TimePeriod": child["TimePeriod"],
+                },
+            )
+
+        for key_result_id in key_result_ids:
+            key_result = node_by_id.get(key_result_id)
+            if not key_result:
+                continue
+            add_row(
+                (objective_id, "key_result", key_result_id),
+                {
+                    "Workspace": key_result["WorkspaceName"],
+                    "Objective": node["Title"],
+                    "ChildObjective": "",
+                    "KeyResult": key_result["Title"],
+                    "Level": "key_result",
+                    "NodeType": "key_result",
+                    "StatusId": key_result["StatusId"],
+                    "Confidence": key_result["Confidence"],
+                    "Progress": key_result["Progress"],
+                    "TimePeriod": key_result["TimePeriod"],
+                },
+            )
+
+            for child_id in child_ids:
+                child_key_results = objective_key_results.get(child_id, [])
+                if key_result_id not in child_key_results:
+                    continue
+                child = node_by_id.get(child_id)
+                if not child:
+                    continue
+                add_row(
+                    (child_id, "child_key_result", key_result_id),
+                    {
+                        "Workspace": key_result["WorkspaceName"],
+                        "Objective": node["Title"],
+                        "ChildObjective": child["Title"],
+                        "KeyResult": key_result["Title"],
+                        "Level": "key_result",
+                        "NodeType": "key_result",
+                        "StatusId": key_result["StatusId"],
+                        "Confidence": key_result["Confidence"],
+                        "Progress": key_result["Progress"],
+                        "TimePeriod": key_result["TimePeriod"],
+                    },
+                )
+
+    return rows
+
+
+def write_management_csv(rows, outfile):
+    fieldnames = [
+        "Workspace",
+        "Objective",
+        "ChildObjective",
+        "KeyResult",
+        "Level",
+        "NodeType",
+        "StatusId",
+        "Confidence",
+        "Progress",
+        "TimePeriod",
+    ]
+    writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+
+
+def build_hierarchical_export(nodes, edges):
+    node_by_id = {node["Id"]: node for node in nodes}
+    children_by_source = {}
+    for edge in edges:
+        children_by_source.setdefault(edge["SourceId"], []).append(edge)
+
+    def format_node(node_id):
+        node = node_by_id[node_id]
+        payload = {
+            "id": node["Id"],
+            "type": node["NodeType"],
+            "role": node["HierarchyRole"],
+            "workspaceId": node["WorkspaceId"],
+            "workspaceName": node["WorkspaceName"],
+            "title": node["Title"],
+            "alias": node["Alias"],
+            "statusId": node["StatusId"],
+            "confidence": node["Confidence"],
+            "progress": node["Progress"],
+            "timePeriod": node["TimePeriod"],
+            "createdAt": node["CreatedAt"],
+            "updatedAt": node["UpdatedAt"],
+            "archived": node["Archived"],
+            "assigneeUserIds": [value for value in node["AssigneeUserIds"].split(",") if value],
+            "children": [],
+        }
+        for edge in children_by_source.get(node_id, []):
+            payload["children"].append(
+                {
+                    "relationType": edge["RelationType"],
+                    "node": format_node(edge["TargetId"]),
+                }
+            )
+        return payload
+
+    root_nodes = [node["Id"] for node in nodes if node["NodeType"] == "workspace"]
+    return {"workspaces": [format_node(node_id) for node_id in root_nodes]}
+
+
+def write_hierarchical_json(payload, outfile):
+    json.dump(payload, outfile, indent=2)
+    outfile.write("\n")
+
+
+def write_path_csv(rows, outfile):
     max_depth = max(len(r) for r in rows) if rows else 0
 
     def get_level_prefix(depth):
@@ -1181,8 +1688,31 @@ def main():
             workspace_by_id,
             workspace_child_map,
         )
+        field_map_cache = {}
+        resolved_item_cache = {}
+        linked_workspace_item_cache = {}
+
         print("Flattening hierarchy paths...", file=sys.stderr)
-        rows = list(flatten_paths(config, tree))
+        rows = list(
+            flatten_paths(
+                config,
+                tree,
+                field_map_cache=field_map_cache,
+                resolved_item_cache=resolved_item_cache,
+                linked_workspace_item_cache=linked_workspace_item_cache,
+            )
+        )
+
+        reporting_nodes, reporting_edges = build_reporting_rows(
+            config,
+            tree,
+            field_map_cache=field_map_cache,
+            resolved_item_cache=resolved_item_cache,
+            linked_workspace_item_cache=linked_workspace_item_cache,
+        )
+
+        management_rows = build_management_rows(reporting_nodes, reporting_edges)
+        hierarchical_payload = build_hierarchical_export(reporting_nodes, reporting_edges)
     except ExporterError as exc:
         print(exc, file=sys.stderr)
         sys.exit(1)
@@ -1190,11 +1720,28 @@ def main():
         print(f"Unexpected error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"  Generated {len(rows)} rows", file=sys.stderr)
-    output_path = get_default_output_path(parent_ws)
-    with open(output_path, "w", newline="", encoding="utf-8") as output_file:
-        write_csv(rows, output_file)
-    print(f"  Wrote CSV to {output_path}", file=sys.stderr)
+    print(f"  Generated {len(rows)} legacy path rows", file=sys.stderr)
+    output_paths = get_output_paths(parent_ws)
+    os.makedirs(os.path.dirname(output_paths["paths"]), exist_ok=True)
+
+    with open(output_paths["paths"], "w", newline="", encoding="utf-8") as output_file:
+        write_path_csv(rows, output_file)
+
+    with open(output_paths["nodes"], "w", newline="", encoding="utf-8") as output_file:
+        write_reporting_nodes_csv(reporting_nodes, output_file)
+    with open(output_paths["edges"], "w", newline="", encoding="utf-8") as output_file:
+        write_reporting_edges_csv(reporting_edges, output_file)
+    with open(output_paths["management"], "w", newline="", encoding="utf-8") as output_file:
+        write_management_csv(management_rows, output_file)
+    with open(output_paths["json"], "w", encoding="utf-8") as output_file:
+        write_hierarchical_json(hierarchical_payload, output_file)
+
+    print(f"  Generated {len(reporting_nodes)} nodes and {len(reporting_edges)} edges", file=sys.stderr)
+    print(f"  Wrote path CSV to {output_paths['paths']}", file=sys.stderr)
+    print(f"  Wrote nodes CSV to {output_paths['nodes']}", file=sys.stderr)
+    print(f"  Wrote edges CSV to {output_paths['edges']}", file=sys.stderr)
+    print(f"  Wrote management CSV to {output_paths['management']}", file=sys.stderr)
+    print(f"  Wrote JSON export to {output_paths['json']}", file=sys.stderr)
 
 
 if __name__ == "__main__":
