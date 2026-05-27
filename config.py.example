@@ -6,3 +6,6 @@ apikey = "your_api_key_here"
 
 # API Base URL
 baseurl = "https://app.airfocus.com"
+
+# SSL Handling
+ignore_ssl_cert_check = True

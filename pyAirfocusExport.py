@@ -1,14 +1,15 @@
 import argparse
 import csv
+import importlib.util
 import json
+import os
+import ssl
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-import config
-
-CONTENT_TYPE = "application/vnd.airfocus.markdown+json"
+CONTENT_TYPE = "application/json"
 
 FIELD_OKR_KEY_RESULTS = "okr-key-results"
 FIELD_OKR_KEY_RESULT_REF = "okr-key-result-reference"
@@ -24,8 +25,96 @@ OKR_FIELD_TYPES = {
     FIELD_OKR_TIME_PERIOD,
 }
 
+HTTP_ERROR_MESSAGES = {
+    401: "Unauthorized: verify the API key in config.py.",
+    403: "Forbidden: the API key does not have permission to access this resource.",
+    429: "Rate limit reached: retry later or slow down requests.",
+}
 
-def api_request(method, path, body=None, params=None):
+SSL_ERROR_HINT = (
+    "SSL verification failed. Set 'ignore_ssl_cert_check = True' in config.py "
+    "or configure a trusted corporate/root CA."
+)
+
+
+class ExporterError(Exception):
+    pass
+
+
+def obfuscate_secret(value, prefix_length=8, suffix_length=4):
+    text = str(value or "")
+    if not text:
+        return "<empty>"
+    if len(text) <= prefix_length + suffix_length:
+        return "xxxx"
+    return f"{text[:prefix_length]}xxxx{text[-suffix_length:]}"
+
+
+def load_config():
+    config_path = os.path.join(os.path.dirname(__file__), "config.py")
+    if not os.path.exists(config_path):
+        print(
+            "Error: config.py is missing. Copy config.py.example to config.py and fill in your values.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    spec = importlib.util.spec_from_file_location("config", config_path)
+    if spec is None or spec.loader is None:
+        print("Error: could not load config.py.", file=sys.stderr)
+        sys.exit(1)
+
+    config_module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(config_module)
+    except Exception as exc:
+        print(f"Error: failed to load config.py: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    missing = [name for name in ("apikey", "baseurl") if not hasattr(config_module, name)]
+    if missing:
+        print(
+            "Error: config.py must define 'apikey' and 'baseurl'. "
+            "Copy config.py.example to config.py and fill in your values.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not hasattr(config_module, "ignore_ssl_cert_check"):
+        config_module.ignore_ssl_cert_check = True
+
+    print(
+        f"Loaded config.py with apikey={obfuscate_secret(config_module.apikey)}",
+        file=sys.stderr,
+    )
+
+    return config_module
+
+
+def unwrap_items_payload(payload):
+    if isinstance(payload, dict):
+        return payload.get("items", [])
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def extract_api_error_message(body_text):
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError:
+        return body_text.strip()
+
+    message = payload.get("message")
+    if message:
+        return message
+    code = payload.get("code")
+    if code:
+        return str(code)
+    return body_text.strip()
+
+
+def api_request(config, method, path, body=None, params=None):
     url = f"{config.baseurl}{path}"
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
@@ -36,16 +125,28 @@ def api_request(method, path, body=None, params=None):
     req.add_header("Content-Type", CONTENT_TYPE)
     req.add_header("Accept", CONTENT_TYPE)
 
+    ssl_context = None
+    if getattr(config, "ignore_ssl_cert_check", True):
+        ssl_context = ssl._create_unverified_context()
+
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, context=ssl_context) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="replace")
-        print(f"API error {e.code} for {method} {path}: {body_text}", file=sys.stderr)
-        raise
+        detail = HTTP_ERROR_MESSAGES.get(e.code) or extract_api_error_message(body_text)
+        raise ExporterError(
+            f"API error {e.code} for {method} {path}: {detail}"
+        ) from None
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, ssl.SSLError):
+            raise ExporterError(SSL_ERROR_HINT) from None
+        raise ExporterError(
+            f"Network error for {method} {path}: {e.reason}"
+        ) from None
 
 
-def search_workspaces(name=None):
+def search_workspaces(config, name=None):
     body = {}
     if name:
         body = {
@@ -61,22 +162,42 @@ def search_workspaces(name=None):
                 ],
             }
         }
-    result = api_request("POST", "/api/workspaces/search", body=body)
+    result = api_request(config, "POST", "/api/workspaces/search", body=body)
     items = result.get("items", [])
     return [ws for ws in items if ws.get("namespace") == "app:okr"]
 
 
-def get_workspace(workspace_id):
-    return api_request("GET", f"/api/workspaces/{workspace_id}")
+def print_accessible_objective_workspaces(config, stream):
+    workspaces = search_workspaces(config)
+    if not workspaces:
+        print("No accessible objective workspaces found.", file=stream)
+        return 0
+
+    print("Accessible objective workspaces:", file=stream)
+    for workspace in sorted(workspaces, key=lambda ws: ws.get("name", "").lower()):
+        alias = workspace.get("alias")
+        label = workspace.get("name", workspace.get("id", "?"))
+        if alias:
+            print(f"- {label} ({alias})", file=stream)
+        else:
+            print(f"- {label}", file=stream)
+    return len(workspaces)
 
 
-def list_workspaces(workspace_ids):
-    return api_request("POST", "/api/workspaces/list", body=workspace_ids)
+def get_workspace(config, workspace_id):
+    return api_request(config, "GET", f"/api/workspaces/{workspace_id}")
 
 
-def search_items(workspace_id, offset=0, limit=1000):
+def list_workspaces(config, workspace_ids):
+    return unwrap_items_payload(
+        api_request(config, "POST", "/api/workspaces/list", body=workspace_ids)
+    )
+
+
+def search_items(config, workspace_id, offset=0, limit=1000):
     params = {"offset": offset, "limit": limit}
     return api_request(
+        config,
         "POST",
         f"/api/workspaces/{workspace_id}/items/search",
         body={},
@@ -84,30 +205,32 @@ def search_items(workspace_id, offset=0, limit=1000):
     )
 
 
-def list_items(workspace_id, item_ids):
-    return api_request(
-        "POST", f"/api/workspaces/{workspace_id}/items/list", body=item_ids
+def list_items(config, workspace_id, item_ids):
+    return unwrap_items_payload(
+        api_request(config, "POST", f"/api/workspaces/{workspace_id}/items/list", body=item_ids)
     )
 
 
-def get_statuses(workspace_id):
-    return api_request("GET", f"/api/workspaces/{workspace_id}/statuses")
+def get_statuses(config, workspace_id):
+    return unwrap_items_payload(
+        api_request(config, "GET", f"/api/workspaces/{workspace_id}/statuses")
+    )
 
 
-def search_fields(workspace_ids=None):
+def search_fields(config, workspace_ids=None):
     body = {}
     if workspace_ids:
         body["workspaceIds"] = workspace_ids
-    result = api_request("POST", "/api/fields/search", body=body)
+    result = api_request(config, "POST", "/api/fields/search", body=body)
     return result.get("items", [])
 
 
-def paginated_search_items(workspace_id):
+def paginated_search_items(config, workspace_id):
     items = []
     offset = 0
     limit = 1000
     while True:
-        page = search_items(workspace_id, offset=offset, limit=limit)
+        page = search_items(config, workspace_id, offset=offset, limit=limit)
         batch = page.get("items", [])
         items.extend(batch)
         if len(batch) < limit:
@@ -116,13 +239,18 @@ def paginated_search_items(workspace_id):
     return items
 
 
-def build_field_type_map(workspace_ids):
-    all_fields = search_fields(workspace_ids)
+def build_field_type_map(config, workspace_ids, cache):
+    cache_key = tuple(sorted(workspace_ids))
+    if cache_key in cache:
+        return cache[cache_key]
+
+    all_fields = search_fields(config, workspace_ids)
     field_map = {}
     for field in all_fields:
         ft = field.get("typeId")
         if ft in OKR_FIELD_TYPES:
             field_map[field["id"]] = ft
+    cache[cache_key] = field_map
     return field_map
 
 
@@ -156,14 +284,33 @@ def extract_item_okr_fields(item, field_map):
     return result
 
 
-def resolve_items(workspace_id, item_ids):
+def resolve_items(config, workspace_id, item_ids, cache):
     if not item_ids:
         return []
+
+    workspace_cache = cache.setdefault(workspace_id, {})
     resolved = []
-    for i in range(0, len(item_ids), 1000):
-        batch = item_ids[i : i + 1000]
-        resolved.extend(list_items(workspace_id, batch))
-    return [r for r in resolved if r is not None]
+    missing_ids = []
+    for item_id in item_ids:
+        cached_item = workspace_cache.get(item_id)
+        if cached_item is not None:
+            resolved.append(cached_item)
+        else:
+            missing_ids.append(item_id)
+
+    if not missing_ids:
+        return resolved
+
+    resolved = []
+    for i in range(0, len(missing_ids), 1000):
+        batch = missing_ids[i : i + 1000]
+        resolved.extend(list_items(config, workspace_id, batch))
+
+    filtered = [item for item in resolved if item is not None]
+    for item in filtered:
+        workspace_cache[item["id"]] = item
+
+    return [workspace_cache[item_id] for item_id in item_ids if item_id in workspace_cache]
 
 
 def discover_child_workspaces(items):
@@ -177,22 +324,26 @@ def discover_child_workspaces(items):
     return child_ws_ids
 
 
-def build_workspace_tree(root_ws_id, visited=None):
+def build_workspace_tree(config, root_ws_id, visited=None):
     if visited is None:
         visited = set()
     if root_ws_id in visited:
         return None
     visited.add(root_ws_id)
 
-    ws = get_workspace(root_ws_id)
+    ws = get_workspace(config, root_ws_id)
     print(f"  Fetching items from workspace '{ws.get('name')}'...", file=sys.stderr)
-    items = paginated_search_items(root_ws_id)
+    items = paginated_search_items(config, root_ws_id)
     print(f"    Found {len(items)} items", file=sys.stderr)
 
-    child_ws_ids = discover_child_workspaces(items) - visited
+    child_ws_ids = {
+        child_ws_id
+        for child_ws_id in discover_child_workspaces(items)
+        if child_ws_id and child_ws_id != root_ws_id and child_ws_id not in visited
+    }
     child_ws = []
     if child_ws_ids:
-        resolved = list_workspaces(list(child_ws_ids))
+        resolved = list_workspaces(config, list(child_ws_ids))
         print(
             f"  Found {len(child_ws_ids)} child workspaces, building hierarchy...",
             file=sys.stderr,
@@ -200,7 +351,7 @@ def build_workspace_tree(root_ws_id, visited=None):
         for cws in resolved:
             if cws is None:
                 continue
-            child = build_workspace_tree(cws["id"], visited)
+            child = build_workspace_tree(config, cws["id"], visited)
             if child:
                 child_ws.append(child)
 
@@ -223,23 +374,42 @@ def get_item_alias(item):
     return str(number) if number is not None else item["id"]
 
 
-def get_status_map(workspace_id):
-    statuses = get_statuses(workspace_id)
-    return {s["id"]: s["name"] for s in statuses}
+def get_status_map(config, workspace_id, cache):
+    if workspace_id in cache:
+        return cache[workspace_id]
+
+    statuses = get_statuses(config, workspace_id)
+    status_map = {status["id"]: status["name"] for status in statuses}
+    cache[workspace_id] = status_map
+    return status_map
 
 
-def flatten_paths(workspace_node, depth=0, ancestor_ctx=None):
+def flatten_paths(
+    config,
+    workspace_node,
+    depth=0,
+    ancestor_ctx=None,
+    field_map_cache=None,
+    status_cache=None,
+    resolved_item_cache=None,
+):
     if ancestor_ctx is None:
         ancestor_ctx = []
+    if field_map_cache is None:
+        field_map_cache = {}
+    if status_cache is None:
+        status_cache = {}
+    if resolved_item_cache is None:
+        resolved_item_cache = {}
 
     ws = workspace_node["workspace"]
     ws_name = ws.get("name", "")
     items = workspace_node["items"]
     children = workspace_node["children"]
 
-    status_map = get_status_map(ws["id"])
+    status_map = get_status_map(config, ws["id"], status_cache)
 
-    field_map = build_field_type_map([ws["id"]])
+    field_map = build_field_type_map(config, [ws["id"]], field_map_cache)
 
     current_ctx = ancestor_ctx + [
         {
@@ -266,9 +436,15 @@ def flatten_paths(workspace_node, depth=0, ancestor_ctx=None):
 
             resolved_krs = []
             if local_ids:
-                resolved_krs.extend(resolve_items(ws["id"], local_ids))
+                resolved_krs.extend(
+                    resolve_items(config, ws["id"], local_ids, resolved_item_cache)
+                )
             for rws_id, ritem_id in cross_ws:
-                ritems = resolve_items(rws_id, [ritem_id])
+                if not rws_id:
+                    continue
+                ritems = resolve_items(
+                    config, rws_id, [ritem_id], resolved_item_cache
+                )
                 resolved_krs.extend(ritems)
 
             if resolved_krs:
@@ -364,7 +540,15 @@ def flatten_paths(workspace_node, depth=0, ancestor_ctx=None):
 
     if children:
         for child in children:
-            yield from flatten_paths(child, depth + 1, current_ctx)
+            yield from flatten_paths(
+                config,
+                child,
+                depth + 1,
+                current_ctx,
+                field_map_cache,
+                status_cache,
+                resolved_item_cache,
+            )
 
 
 def write_csv(rows, outfile):
@@ -408,41 +592,48 @@ def main():
     )
     parser.add_argument(
         "--root",
-        required=True,
         help="Name of the root objective workspace to export",
     )
     args = parser.parse_args()
 
-    if not hasattr(config, "apikey") or not hasattr(config, "baseurl"):
-        print(
-            "Error: config.py must define 'apikey' and 'baseurl'. "
-            "Copy config.py.example to config.py and fill in your values.",
-            file=sys.stderr,
-        )
+    config = load_config()
+
+    try:
+        if not args.root:
+            print_accessible_objective_workspaces(config, sys.stdout)
+            return
+
+        print(f"Searching for objective workspace '{args.root}'...", file=sys.stderr)
+        matches = search_workspaces(config, args.root)
+        if not matches:
+            all_okr = search_workspaces(config)
+            names = [ws.get("name", "?") for ws in all_okr]
+            print(
+                f"Error: No objective workspace found matching '{args.root}'.",
+                file=sys.stderr,
+            )
+            if names:
+                print(
+                    f"Available objective workspaces: {', '.join(names)}",
+                    file=sys.stderr,
+                )
+            sys.exit(1)
+
+        root_ws = matches[0]
+        root_ws_id = root_ws["id"]
+        print(f"  Found: '{root_ws['name']}' (id={root_ws_id})", file=sys.stderr)
+
+        print("Building workspace hierarchy...", file=sys.stderr)
+        tree = build_workspace_tree(config, root_ws_id)
+        print("Flattening hierarchy paths...", file=sys.stderr)
+        rows = list(flatten_paths(config, tree))
+    except ExporterError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"Unexpected error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Searching for objective workspace '{args.root}'...", file=sys.stderr)
-    matches = search_workspaces(args.root)
-    if not matches:
-        all_okr = search_workspaces()
-        names = [ws.get("name", "?") for ws in all_okr]
-        print(
-            f"Error: No objective workspace found matching '{args.root}'.",
-            file=sys.stderr,
-        )
-        if names:
-            print(f"Available objective workspaces: {', '.join(names)}", file=sys.stderr)
-        sys.exit(1)
-
-    root_ws = matches[0]
-    root_ws_id = root_ws["id"]
-    print(f"  Found: '{root_ws['name']}' (id={root_ws_id})", file=sys.stderr)
-
-    print("Building workspace hierarchy...", file=sys.stderr)
-    tree = build_workspace_tree(root_ws_id)
-
-    print("Flattening hierarchy paths...", file=sys.stderr)
-    rows = list(flatten_paths(tree))
     print(f"  Generated {len(rows)} rows", file=sys.stderr)
 
     write_csv(rows, sys.stdout)
