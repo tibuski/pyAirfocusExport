@@ -1,0 +1,8 @@
+# Airfocus API Configuration
+# Copy this file to 'config.py' and fill in your values
+
+# API Authentication
+apikey = "your_api_key_here"
+
+# API Base URL
+baseurl = https://app.airfocus.com
