@@ -1,5 +1,6 @@
 import argparse
 import csv
+from datetime import datetime
 import importlib.util
 import json
 import os
@@ -10,7 +11,6 @@ import urllib.parse
 import urllib.request
 
 CONTENT_TYPE = "application/json"
-
 FIELD_OKR_KEY_RESULTS = "okr-key-results"
 FIELD_OKR_KEY_RESULT_REF = "okr-key-result-reference"
 FIELD_OKR_CONFIDENCE = "okr-confidence"
@@ -36,7 +36,6 @@ SSL_ERROR_HINT = (
     "or configure a trusted corporate/root CA."
 )
 
-
 class ExporterError(Exception):
     pass
 
@@ -48,7 +47,6 @@ def obfuscate_secret(value, prefix_length=8, suffix_length=4):
     if len(text) <= prefix_length + suffix_length:
         return "xxxx"
     return f"{text[:prefix_length]}xxxx{text[-suffix_length:]}"
-
 
 def load_config():
     config_path = os.path.join(os.path.dirname(__file__), "config.py")
@@ -167,20 +165,220 @@ def search_workspaces(config, name=None):
     return [ws for ws in items if ws.get("namespace") == "app:okr"]
 
 
+def get_workspace_label(workspace):
+    alias = workspace.get("alias")
+    label = workspace.get("name", workspace.get("id", "?"))
+    if alias:
+        return f"{label} ({alias})"
+    return label
+
+
+def get_workspace_alias(workspace):
+    return workspace.get("alias") or ""
+
+
+def sanitize_filename_component(value):
+    text = str(value or "").strip()
+    if not text:
+        return "export"
+
+    invalid_chars = '<>:"/\\|?*'
+    sanitized = "".join("-" if char in invalid_chars else char for char in text)
+    sanitized = " ".join(sanitized.split())
+    sanitized = sanitized.replace(" ", "-").strip(".-")
+    return sanitized or "export"
+
+
+def get_default_output_path(workspace):
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    workspace_name = workspace.get("name") or workspace.get("alias") or workspace.get("id")
+    safe_name = sanitize_filename_component(workspace_name)
+    return os.path.join(os.getcwd(), "Output", f"{timestamp}-{safe_name}.csv")
+
+
+def sort_workspaces(workspaces):
+    return sorted(workspaces, key=lambda ws: ws.get("name", "").lower())
+
+
+def normalize_embedded_collection(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        items = value.get("items")
+        if isinstance(items, list):
+            return items
+        return [item for item in value.values() if isinstance(item, dict)]
+    return []
+
+
+def add_workspace_edge(parent_map, child_map, parent_id, child_id):
+    if not parent_id or not child_id or parent_id == child_id:
+        return
+    child_map.setdefault(parent_id, set()).add(child_id)
+    parent_map.setdefault(child_id, set()).add(parent_id)
+
+
+def discover_hierarchy_edges(node, accessible_ids, parent_map, child_map, current_parent=None):
+    if not isinstance(node, dict):
+        return
+
+    workspace_id = node.get("workspaceId") or node.get("id")
+    if workspace_id not in accessible_ids:
+        workspace_id = None
+
+    if current_parent and workspace_id:
+        add_workspace_edge(parent_map, child_map, current_parent, workspace_id)
+
+    next_parent = workspace_id or current_parent
+    for child in normalize_embedded_collection(node.get("children")):
+        discover_hierarchy_edges(child, accessible_ids, parent_map, child_map, next_parent)
+
+
+def get_workspace_relationship_maps(workspaces):
+    workspace_by_id = {workspace["id"]: workspace for workspace in workspaces}
+    accessible_ids = set(workspace_by_id)
+    child_map = {workspace_id: set() for workspace_id in workspace_by_id}
+    parent_map = {workspace_id: set() for workspace_id in workspace_by_id}
+
+    for workspace in workspaces:
+        workspace_id = workspace["id"]
+        embedded = workspace.get("_embedded", {})
+
+        for app in normalize_embedded_collection(embedded.get("apps")):
+            settings = app.get("settings", {})
+            hierarchy = settings.get("hierarchy")
+            if isinstance(hierarchy, dict):
+                discover_hierarchy_edges(
+                    hierarchy,
+                    accessible_ids,
+                    parent_map,
+                    child_map,
+                )
+            elif isinstance(hierarchy, list):
+                for node in hierarchy:
+                    discover_hierarchy_edges(
+                        node,
+                        accessible_ids,
+                        parent_map,
+                        child_map,
+                    )
+
+        for child in normalize_embedded_collection(embedded.get("children")):
+            child_id = child.get("id") or child.get("workspaceId")
+            if child_id in accessible_ids:
+                add_workspace_edge(parent_map, child_map, workspace_id, child_id)
+
+        for parent in normalize_embedded_collection(embedded.get("parents")):
+            parent_id = parent.get("id") or parent.get("workspaceId")
+            if parent_id in accessible_ids:
+                add_workspace_edge(parent_map, child_map, parent_id, workspace_id)
+
+    sorted_child_map = {
+        workspace_id: sorted(
+            child_ids,
+            key=lambda child_id: workspace_by_id[child_id].get("name", "").lower(),
+        )
+        for workspace_id, child_ids in child_map.items()
+    }
+    return workspace_by_id, sorted_child_map, parent_map
+
+
+def get_accessible_objective_workspaces(config, name=None):
+    workspaces = search_workspaces(config, name=name)
+    if not workspaces:
+        return []
+
+    workspace_ids = [workspace["id"] for workspace in workspaces if workspace.get("id")]
+    if not workspace_ids:
+        return workspaces
+
+    detailed_workspaces = list_workspaces(config, workspace_ids)
+    if not detailed_workspaces:
+        return workspaces
+
+    detailed_by_id = {
+        workspace.get("id"): workspace
+        for workspace in detailed_workspaces
+        if isinstance(workspace, dict) and workspace.get("id")
+    }
+    return [detailed_by_id.get(workspace_id, {"id": workspace_id}) for workspace_id in workspace_ids]
+
+
+def normalize_workspace_key(value):
+    return str(value or "").strip().casefold()
+
+
+def find_matching_workspaces(workspaces, query):
+    normalized_query = normalize_workspace_key(query)
+    if not normalized_query:
+        return []
+
+    return [
+        workspace
+        for workspace in workspaces
+        if normalize_workspace_key(workspace.get("name")) == normalized_query
+        or normalize_workspace_key(workspace.get("alias")) == normalized_query
+    ]
+
+
+def format_workspace_hierarchy_lines(workspace_by_id, child_map, top_level_ids):
+    lines = []
+    visited = set()
+
+    def render_node(workspace_id, depth, path):
+        workspace = workspace_by_id[workspace_id]
+        indent = "  " * depth
+        lines.append(f"{indent}- {get_workspace_label(workspace)}")
+        rendered_ids = {workspace_id}
+
+        if workspace_id in path:
+            lines.append(f"{indent}  - [cycle detected]")
+            return rendered_ids
+
+        next_path = path | {workspace_id}
+        for child_id in child_map.get(workspace_id, []):
+            rendered_ids.update(render_node(child_id, depth + 1, next_path))
+        return rendered_ids
+
+    for workspace_id in top_level_ids:
+        visited.update(render_node(workspace_id, 0, set()))
+
+    remaining_ids = [
+        workspace_id
+        for workspace_id in sorted(
+            workspace_by_id,
+            key=lambda current_id: workspace_by_id[current_id].get("name", "").lower(),
+        )
+        if workspace_id not in top_level_ids
+    ]
+
+    for workspace_id in remaining_ids:
+        if workspace_id in visited:
+            continue
+        visited.update(render_node(workspace_id, 0, set()))
+
+    return lines
+
+
 def print_accessible_objective_workspaces(config, stream):
-    workspaces = search_workspaces(config)
+    workspaces = get_accessible_objective_workspaces(config)
     if not workspaces:
         print("No accessible objective workspaces found.", file=stream)
         return 0
 
-    print("Accessible objective workspaces:", file=stream)
-    for workspace in sorted(workspaces, key=lambda ws: ws.get("name", "").lower()):
-        alias = workspace.get("alias")
-        label = workspace.get("name", workspace.get("id", "?"))
-        if alias:
-            print(f"- {label} ({alias})", file=stream)
-        else:
-            print(f"- {label}", file=stream)
+    print("Resolving accessible objective workspace hierarchy...", file=sys.stderr)
+    workspace_by_id, child_map, parent_map = get_workspace_relationship_maps(workspaces)
+    top_level_ids = [
+        workspace["id"]
+        for workspace in sort_workspaces(workspaces)
+        if not parent_map.get(workspace["id"])
+    ]
+    if not top_level_ids:
+        top_level_ids = [workspace["id"] for workspace in sort_workspaces(workspaces)]
+
+    print("Accessible objective workspace hierarchy:", file=stream)
+    for line in format_workspace_hierarchy_lines(workspace_by_id, child_map, top_level_ids):
+        print(line, file=stream)
     return len(workspaces)
 
 
@@ -189,6 +387,8 @@ def get_workspace(config, workspace_id):
 
 
 def list_workspaces(config, workspace_ids):
+    if not workspace_ids:
+        return []
     return unwrap_items_payload(
         api_request(config, "POST", "/api/workspaces/list", body=workspace_ids)
     )
@@ -208,12 +408,6 @@ def search_items(config, workspace_id, offset=0, limit=1000):
 def list_items(config, workspace_id, item_ids):
     return unwrap_items_payload(
         api_request(config, "POST", f"/api/workspaces/{workspace_id}/items/list", body=item_ids)
-    )
-
-
-def get_statuses(config, workspace_id):
-    return unwrap_items_payload(
-        api_request(config, "GET", f"/api/workspaces/{workspace_id}/statuses")
     )
 
 
@@ -313,45 +507,43 @@ def resolve_items(config, workspace_id, item_ids, cache):
     return [workspace_cache[item_id] for item_id in item_ids if item_id in workspace_cache]
 
 
-def discover_child_workspaces(items):
-    child_ws_ids = set()
-    for item in items:
-        embed = item.get("_embedded", {})
-        for child in embed.get("children", []):
-            wid = child.get("workspaceId")
-            if wid:
-                child_ws_ids.add(wid)
-    return child_ws_ids
-
-
-def build_workspace_tree(config, root_ws_id, visited=None):
+def build_workspace_tree(
+    config,
+    parent_ws_id,
+    workspace_by_id,
+    workspace_child_map,
+    visited=None,
+):
     if visited is None:
         visited = set()
-    if root_ws_id in visited:
+    if parent_ws_id in visited:
         return None
-    visited.add(root_ws_id)
+    visited.add(parent_ws_id)
 
-    ws = get_workspace(config, root_ws_id)
+    ws = workspace_by_id.get(parent_ws_id) or get_workspace(config, parent_ws_id)
     print(f"  Fetching items from workspace '{ws.get('name')}'...", file=sys.stderr)
-    items = paginated_search_items(config, root_ws_id)
+    items = paginated_search_items(config, parent_ws_id)
     print(f"    Found {len(items)} items", file=sys.stderr)
 
-    child_ws_ids = {
-        child_ws_id
-        for child_ws_id in discover_child_workspaces(items)
-        if child_ws_id and child_ws_id != root_ws_id and child_ws_id not in visited
-    }
     child_ws = []
+    child_ws_ids = [
+        child_ws_id
+        for child_ws_id in workspace_child_map.get(parent_ws_id, [])
+        if child_ws_id != parent_ws_id and child_ws_id not in visited
+    ]
     if child_ws_ids:
-        resolved = list_workspaces(config, list(child_ws_ids))
         print(
             f"  Found {len(child_ws_ids)} child workspaces, building hierarchy...",
             file=sys.stderr,
         )
-        for cws in resolved:
-            if cws is None:
-                continue
-            child = build_workspace_tree(config, cws["id"], visited)
+        for child_ws_id in child_ws_ids:
+            child = build_workspace_tree(
+                config,
+                child_ws_id,
+                workspace_by_id,
+                workspace_child_map,
+                visited,
+            )
             if child:
                 child_ws.append(child)
 
@@ -374,31 +566,18 @@ def get_item_alias(item):
     return str(number) if number is not None else item["id"]
 
 
-def get_status_map(config, workspace_id, cache):
-    if workspace_id in cache:
-        return cache[workspace_id]
-
-    statuses = get_statuses(config, workspace_id)
-    status_map = {status["id"]: status["name"] for status in statuses}
-    cache[workspace_id] = status_map
-    return status_map
-
-
 def flatten_paths(
     config,
     workspace_node,
     depth=0,
     ancestor_ctx=None,
     field_map_cache=None,
-    status_cache=None,
     resolved_item_cache=None,
 ):
     if ancestor_ctx is None:
         ancestor_ctx = []
     if field_map_cache is None:
         field_map_cache = {}
-    if status_cache is None:
-        status_cache = {}
     if resolved_item_cache is None:
         resolved_item_cache = {}
 
@@ -406,8 +585,6 @@ def flatten_paths(
     ws_name = ws.get("name", "")
     items = workspace_node["items"]
     children = workspace_node["children"]
-
-    status_map = get_status_map(config, ws["id"], status_cache)
 
     field_map = build_field_type_map(config, [ws["id"]], field_map_cache)
 
@@ -427,7 +604,6 @@ def flatten_paths(
     item_kr_list = []
     for item in items:
         okr = extract_item_okr_fields(item, field_map)
-        status_name = status_map.get(item.get("statusId"), item.get("statusId"))
 
         kr_ids = okr["kr_ids"]
         if kr_ids:
@@ -455,7 +631,7 @@ def flatten_paths(
                             "item": item,
                             "child_item": None,
                             "kr_alias": kr_alias,
-                            "status": status_name,
+                            "status": "",
                             "confidence": okr["confidence"],
                             "progress": okr["progress"],
                             "time_period": okr["time_period"],
@@ -467,7 +643,7 @@ def flatten_paths(
                         "item": item,
                         "child_item": None,
                         "kr_alias": None,
-                        "status": status_name,
+                        "status": "",
                         "confidence": okr["confidence"],
                         "progress": okr["progress"],
                         "time_period": okr["time_period"],
@@ -479,7 +655,7 @@ def flatten_paths(
                     "item": item,
                     "child_item": None,
                     "kr_alias": None,
-                    "status": status_name,
+                    "status": "",
                     "confidence": okr["confidence"],
                     "progress": okr["progress"],
                     "time_period": okr["time_period"],
@@ -546,7 +722,6 @@ def flatten_paths(
                 depth + 1,
                 current_ctx,
                 field_map_cache,
-                status_cache,
                 resolved_item_cache,
             )
 
@@ -591,25 +766,28 @@ def main():
         description="Export airfocus objective workspaces with hierarchy and key results to CSV."
     )
     parser.add_argument(
-        "--root",
-        help="Name of the root objective workspace to export",
+        "--parent",
+        help="Name or short name of the parent objective workspace to export",
     )
     args = parser.parse_args()
 
     config = load_config()
 
     try:
-        if not args.root:
+        if not args.parent:
             print_accessible_objective_workspaces(config, sys.stdout)
             return
 
-        print(f"Searching for objective workspace '{args.root}'...", file=sys.stderr)
-        matches = search_workspaces(config, args.root)
+        print(
+            f"Searching for objective workspace '{args.parent}' by name or short name...",
+            file=sys.stderr,
+        )
+        all_okr = get_accessible_objective_workspaces(config)
+        matches = find_matching_workspaces(all_okr, args.parent)
         if not matches:
-            all_okr = search_workspaces(config)
-            names = [ws.get("name", "?") for ws in all_okr]
+            names = [get_workspace_label(ws) for ws in sort_workspaces(all_okr)]
             print(
-                f"Error: No objective workspace found matching '{args.root}'.",
+                f"Error: No objective workspace found matching '{args.parent}' by name or short name.",
                 file=sys.stderr,
             )
             if names:
@@ -619,12 +797,18 @@ def main():
                 )
             sys.exit(1)
 
-        root_ws = matches[0]
-        root_ws_id = root_ws["id"]
-        print(f"  Found: '{root_ws['name']}' (id={root_ws_id})", file=sys.stderr)
+        parent_ws = matches[0]
+        parent_ws_id = parent_ws["id"]
+        print(f"  Found: '{parent_ws['name']}' (id={parent_ws_id})", file=sys.stderr)
 
         print("Building workspace hierarchy...", file=sys.stderr)
-        tree = build_workspace_tree(config, root_ws_id)
+        workspace_by_id, workspace_child_map, _ = get_workspace_relationship_maps(all_okr)
+        tree = build_workspace_tree(
+            config,
+            parent_ws_id,
+            workspace_by_id,
+            workspace_child_map,
+        )
         print("Flattening hierarchy paths...", file=sys.stderr)
         rows = list(flatten_paths(config, tree))
     except ExporterError as exc:
@@ -635,8 +819,10 @@ def main():
         sys.exit(1)
 
     print(f"  Generated {len(rows)} rows", file=sys.stderr)
-
-    write_csv(rows, sys.stdout)
+    output_path = get_default_output_path(parent_ws)
+    with open(output_path, "w", newline="", encoding="utf-8") as output_file:
+        write_csv(rows, output_file)
+    print(f"  Wrote CSV to {output_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -78,6 +78,10 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Generated exports
+Output/*
+!Output/.gitkeep
+
 # IPython
 profile_default/
 ipython_config.py

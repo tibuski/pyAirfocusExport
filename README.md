@@ -6,10 +6,11 @@ Export airfocus OKR workspaces with hierarchy and key results to CSV.
 
 ```sh
 uv run pyAirfocusExport.py
-uv run pyAirfocusExport.py --root "Objective Workspace Name" > output.csv
+uv run pyAirfocusExport.py --parent "Objective Workspace Name"
+uv run pyAirfocusExport.py --parent "WORKSPACEALIAS"
 ```
 
-Run without arguments to list the objective workspaces you can access.
+Run without arguments to list the objective workspace hierarchy you can access.
 
 ## Setup
 
@@ -25,7 +26,7 @@ uv --version
 uv venv
 Copy-Item config.py.example config.py
 uv run pyAirfocusExport.py
-uv run pyAirfocusExport.py --root "Objective Workspace Name" > output.csv
+uv run pyAirfocusExport.py --parent "Objective Workspace Name"
 ```
 
 `config.py` must define:
@@ -50,7 +51,7 @@ Dynamic columns per hierarchy depth:
 | `Parent{N}_Item` | Objective item name |
 | `Parent{N}_ChildItem` | Child objective (within same workspace) |
 | `Parent{N}_KeyResult` | Key result alias linked to the objective |
-| `Status` | Status of the deepest objective |
+| `Status` | Empty placeholder column; workspace status metadata is not queried |
 | `Confidence` | OKR confidence (high/medium/low) |
 | `Progress` | Progress percentage |
 | `TimePeriod` | OKR time period |
@@ -64,8 +65,10 @@ Dynamic columns per hierarchy depth:
 
 ## Runtime behavior
 
-- Running without `--root` lists accessible objective workspaces and exits
-- Logs progress and API errors to stderr so CSV output stays clean on stdout
+- Running without `--parent` lists the accessible objective workspace hierarchy from workspace metadata and exits
+- Running with `--parent` writes a CSV file named `Output\[date-time]-[parent-name].csv`
+- Logs progress and API errors to stderr
 - Paginates workspace items with a page size of 1000
-- Prints available objective workspaces when `--root` is not found
+- Accepts either the full workspace name or the workspace short name / alias in `--parent`
+- Prints available objective workspaces when `--parent` is not found
 - Supports `ignore_ssl_cert_check = True` in `config.py` for environments with intercepted TLS certificates

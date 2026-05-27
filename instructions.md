@@ -12,8 +12,10 @@
 
 * Main goal is to export objective workspaces with hierarchy and corresponding key results for each level of objective workspace.
 * The result should be a .csv file that will be used to create graphics and reports.
-* Running `uv run pyAirfocusExport.py` without arguments should list the accessible parent objective workspaces.
-* Export usage is `uv run pyAirfocusExport.py --root "Objective Workspace Name"`
+* Running `uv run pyAirfocusExport.py` without arguments should list the accessible objective workspace hierarchy.
+* Export usage is `uv run pyAirfocusExport.py --parent "Objective Workspace Name"`
+* `--parent` accepts either the full workspace name or the workspace short name / alias.
+* By default, exporting with `--parent` writes `Output\[date-time]-[parent-name].csv`.
 
 # Implementation Plan
 
@@ -55,7 +57,7 @@ Example for a 2-level hierarchy: `Parent0`, `Parent0_Item`, `Parent0_ChildItem`,
 
 | Column | Description |
 |---|---|
-| `Status` | Current status of the deepest objective |
+| `Status` | Empty placeholder column; workspace status metadata is not queried |
 | `Confidence` | OKR confidence level (high/medium/low) |
 | `Progress` | Progress percentage |
 | `TimePeriod` | OKR time period |
@@ -65,7 +67,7 @@ Example for a 2-level hierarchy: `Parent0`, `Parent0_Item`, `Parent0_ChildItem`,
 ### 1. Search Workspaces
 `POST /api/workspaces/search`
 
-Finds the root objective workspace by name. Send an empty body or a filter matching the workspace name. Returns a paginated list of `WorkspaceWithWorkspaceEmbed` objects. Filter results to only those with `namespace == "app:okr"`.
+Finds the parent objective workspace by name. Send an empty body or a filter matching the workspace name. Returns a paginated list of `WorkspaceWithWorkspaceEmbed` objects. Filter results to only those with `namespace == "app:okr"`.
 
 ### 2. Get Workspace by ID
 `GET /api/workspaces/{workspaceId}`
@@ -75,7 +77,7 @@ Returns details of a single workspace, including its `namespace` (`"app:okr"` = 
 ### 2b. List Workspaces by ID
 `POST /api/workspaces/list`
 
-Takes an array of workspace UUIDs in the request body and returns their details. Used to resolve child objective workspaces discovered while traversing item relationships.
+Takes an array of workspace UUIDs in the request body and returns their details. Used to enrich accessible objective workspaces with `_embedded.parents`, `_embedded.children`, and OKR app settings so the no-argument hierarchy can be built locally. It is also used to resolve child objective workspaces discovered while traversing item relationships during export.
 
 ### 3. Search Items in a Workspace
 `POST /api/workspaces/{workspaceId}/items/search?offset=0&limit=1000`
@@ -92,12 +94,7 @@ Returns items with key properties:
 
 Takes an array of item UUIDs in the request body and returns their full details. Used to resolve child workspace items or key results after discovering their IDs.
 
-### 5. Get Workspace Statuses
-`GET /api/workspaces/{workspaceId}/statuses`
-
-Returns the status definitions for a workspace, mapping `statusId` values to human-readable names and categories.
-
-### 6. Search Fields
+### 5. Search Fields
 `POST /api/fields/search`
 
 Discovers which custom fields are installed in a workspace, including OKR-specific fields (`okr-key-results`, `okr-key-result-reference`, `okr-confidence`, `okr-progress`, `okr-time-period`). Required to interpret the raw `fields` map on items.
@@ -140,32 +137,30 @@ Use `Content-Type: application/json` and accept `application/json` (or `applicat
 
 1. **Bootstrap** — Read `apikey` and `baseurl` from `config.py`.
 
-2. **List accessible objective workspaces when no root is provided** — If `--root` is omitted, search workspaces with an empty filter, keep only those with `namespace == "app:okr"`, print their names, and exit without exporting CSV.
+2. **List accessible objective workspaces when no parent is provided** — If `--parent` is omitted, search workspaces with an empty filter, keep only those with `namespace == "app:okr"`, load their full workspace details with `POST /api/workspaces/list`, derive parent/child links from workspace `_embedded.parents`, `_embedded.children`, and OKR app hierarchy settings, print the hierarchy, and exit without exporting CSV.
 
-3. **Find root objective workspace** — Search workspaces by name (the `--root` argument). Filter to only those with `namespace == "app:okr"`. If not found, list all accessible objective workspaces to help the user. This is `Parent0`.
+3. **Find parent objective workspace** — Load the accessible objective workspaces and match the `--parent` argument locally against either the workspace name or alias (case-insensitive). If not found, list all accessible objective workspaces to help the user. This is `Parent0`.
 
-4. **Build workspace hierarchy** — Recursively traverse from the root:
-   - Search items in current workspace.
-   - Each item may have parent/child objectives within the same workspace (via `_embedded.parents`/`_embedded.children`).
-   - Each item's children may reference a child objective workspace (via `workspaceId` differing from the current).
-   - Collect all discovered child workspace IDs, resolve them via `POST /api/workspaces/list`, and recurse. These become `Parent1`, `Parent2`, etc.
+4. **Build workspace hierarchy** — Recursively traverse from the parent workspace using workspace metadata:
+      - Load accessible OKR workspaces and derive parent/child workspace links from `_embedded.parents`, `_embedded.children`, and OKR app hierarchy settings.
+      - Start from the selected parent workspace and recurse through its child objective workspaces. These become `Parent1`, `Parent2`, etc.
+      - For each workspace in that tree, fetch its items via `POST /api/workspaces/{id}/items/search`.
 
 5. **Extract items and key results** — For each workspace in the hierarchy:
    - Fetch all items via `POST /api/workspaces/{id}/items/search`.
    - For each item, read the `okr-key-results` field to get linked key result UUIDs.
    - Resolve key result details via `POST /api/workspaces/{workspaceId}/items/list`.
    - Read `okr-confidence`, `okr-progress`, and `okr-time-period` from item fields.
-   - Map `statusId` to human-readable status via the workspace statuses endpoint.
 
 6. **Build parent-child relationships** — Use `_embedded.parents` and `_embedded.children` on each item to reconstruct the hierarchy.
 
-7. **Write CSV** — Build the column list dynamically based on max hierarchy depth. For each path from root to leaf, output one row per key result at each level. Use `csv.DictWriter`.
+7. **Write CSV** — Build the column list dynamically based on max hierarchy depth. For each path from the parent workspace to a leaf, output one row per key result at each level. Use `csv.DictWriter`.
 
 ## Error Handling
 
 - If `config.py` is missing or malformed, print a clear error and exit.
-- If no `--root` argument is provided, print the accessible objective workspaces and exit successfully.
-- If the root workspace name is not found, print available objective workspaces (`namespace == "app:okr"`) and exit.
+- If no `--parent` argument is provided, print the accessible objective workspace hierarchy and exit successfully.
+- If the parent workspace name is not found, print available objective workspaces (`namespace == "app:okr"`) and exit.
 - If TLS interception breaks certificate validation, allow `ignore_ssl_cert_check = True` in `config.py`.
 - Paginate results (max 1000 per page) to handle large workspaces.
 - Handle HTTP errors (401 = bad API key, 403 = insufficient permissions, 429 = rate limit).
