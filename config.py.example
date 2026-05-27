@@ -5,4 +5,4 @@
 apikey = "your_api_key_here"
 
 # API Base URL
-baseurl = https://app.airfocus.com
+baseurl = "https://app.airfocus.com"
