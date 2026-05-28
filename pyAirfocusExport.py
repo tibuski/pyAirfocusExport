@@ -990,12 +990,23 @@ def flatten_paths(
         linked_workspace_item_cache,
     )
 
-    objective_key_result_rows = []
+    objective_rows_by_id = {}
+    key_result_rows_by_objective_id = {}
     for item in items:
         okr = extract_item_okr_fields(item, field_map)
+        objective_id = item["id"]
+
+        objective_rows_by_id[objective_id] = {
+            "item": item,
+            "status": "",
+            "confidence": okr["confidence"],
+            "progress": okr["progress"],
+            "time_period": okr["time_period"],
+        }
 
         kr_ids = okr["kr_ids"]
         direct_krs = list(okr["kr_entries"])
+        key_result_rows = []
         if kr_ids or direct_krs:
             local_ids = [i for i in kr_ids if isinstance(i, str)]
             cross_ws = [i for i in kr_ids if isinstance(i, tuple)]
@@ -1028,10 +1039,8 @@ def flatten_paths(
                 for kr in resolved_krs:
                     kr_alias = get_key_result_label(kr)
                     kr_values = get_key_result_row_values(kr)
-                    objective_key_result_rows.append(
+                    key_result_rows.append(
                         {
-                            "item": item,
-                            "child_item": None,
                             "kr_alias": kr_alias,
                             "status": "",
                             "confidence": kr_values["confidence"] if kr_values["confidence"] is not None else okr["confidence"],
@@ -1039,27 +1048,13 @@ def flatten_paths(
                             "time_period": kr_values["time_period"] or okr["time_period"],
                         }
                     )
-            else:
-                objective_key_result_rows.append(
-                    {
-                        "item": item,
-                        "child_item": None,
-                        "kr_alias": None,
-                        "status": "",
-                        "confidence": okr["confidence"],
-                        "progress": okr["progress"],
-                        "time_period": okr["time_period"],
-                    }
-                )
         else:
             linked_krs = linked_krs_by_objective.get(item["id"], [])
             if linked_krs:
                 for kr in linked_krs:
                     kr_values = get_key_result_row_values(kr)
-                    objective_key_result_rows.append(
+                    key_result_rows.append(
                         {
-                            "item": item,
-                            "child_item": None,
                             "kr_alias": get_key_result_label(kr),
                             "status": "",
                             "confidence": kr_values["confidence"] if kr_values["confidence"] is not None else okr["confidence"],
@@ -1067,19 +1062,8 @@ def flatten_paths(
                             "time_period": kr_values["time_period"] or okr["time_period"],
                         }
                     )
-                continue
 
-            objective_key_result_rows.append(
-                {
-                    "item": item,
-                    "child_item": None,
-                    "kr_alias": None,
-                    "status": "",
-                    "confidence": okr["confidence"],
-                    "progress": okr["progress"],
-                    "time_period": okr["time_period"],
-                }
-            )
+        key_result_rows_by_objective_id[objective_id] = key_result_rows
 
     workspace_item_parent_map = {}
     for item in items:
@@ -1091,22 +1075,21 @@ def flatten_paths(
         ]
         workspace_item_parent_map[item["id"]] = parents_list
 
-    root_objective_rows = [
-        objective_row
-        for objective_row in objective_key_result_rows
-        if not workspace_item_parent_map.get(objective_row["item"]["id"])
+    root_objective_ids = [
+        objective_id
+        for objective_id in objective_rows_by_id
+        if not workspace_item_parent_map.get(objective_id)
     ]
 
     child_objective_map = {}
-    for objective_row in objective_key_result_rows:
-        item_id = objective_row["item"]["id"]
-        parent_item_ids = workspace_item_parent_map.get(item_id, [])
+    for objective_id in objective_rows_by_id:
+        parent_item_ids = workspace_item_parent_map.get(objective_id, [])
         for parent_item_id in parent_item_ids:
-            child_objective_map.setdefault(parent_item_id, []).append(objective_row)
+            child_objective_map.setdefault(parent_item_id, []).append(objective_id)
 
     def build_objective_key_result_paths(
-        root_objective_row,
-        current_objective_row,
+        root_objective_id,
+        current_objective_id,
         current_workspace_level,
         child_objective_path=None,
         visited=None,
@@ -1116,41 +1099,50 @@ def flatten_paths(
         if visited is None:
             visited = set()
 
-        current_id = current_objective_row["item"]["id"]
-        if current_id in visited:
+        if current_objective_id in visited:
             return
 
-        child_objective_rows = child_objective_map.get(current_id, [])
+        current_objective = objective_rows_by_id[current_objective_id]
+        root_objective = objective_rows_by_id[root_objective_id]
+        child_objective_ids = child_objective_map.get(current_objective_id, [])
 
-        if current_objective_row["kr_alias"] is not None or not child_objective_rows:
-            workspace_level_entry = current_workspace_level.copy()
-            workspace_level_entry["objective_name"] = root_objective_row["item"].get("name", "")
-            workspace_level_entry["child_objective_name"] = " > ".join(child_objective_path) or None
-            workspace_level_entry["kr_alias"] = current_objective_row["kr_alias"]
-            workspace_level_entry["status"] = current_objective_row["status"]
-            workspace_level_entry["confidence"] = current_objective_row["confidence"]
-            workspace_level_entry["progress"] = current_objective_row["progress"]
-            workspace_level_entry["time_period"] = current_objective_row["time_period"]
-            yield list(current_workspace_path[:-1]) + [workspace_level_entry]
+        objective_level_entry = current_workspace_level.copy()
+        objective_level_entry["objective_name"] = root_objective["item"].get("name", "")
+        objective_level_entry["child_objective_name"] = " > ".join(child_objective_path) or None
+        objective_level_entry["kr_alias"] = None
+        objective_level_entry["status"] = current_objective["status"]
+        objective_level_entry["confidence"] = current_objective["confidence"]
+        objective_level_entry["progress"] = current_objective["progress"]
+        objective_level_entry["time_period"] = current_objective["time_period"]
+        yield list(current_workspace_path[:-1]) + [objective_level_entry]
 
-        if child_objective_rows:
-            next_visited = visited | {current_id}
-            for child_objective_row in child_objective_rows:
-                child_name = child_objective_row["item"].get("name", "")
+        for key_result_row in key_result_rows_by_objective_id.get(current_objective_id, []):
+            key_result_level_entry = objective_level_entry.copy()
+            key_result_level_entry["kr_alias"] = key_result_row["kr_alias"]
+            key_result_level_entry["status"] = key_result_row["status"]
+            key_result_level_entry["confidence"] = key_result_row["confidence"]
+            key_result_level_entry["progress"] = key_result_row["progress"]
+            key_result_level_entry["time_period"] = key_result_row["time_period"]
+            yield list(current_workspace_path[:-1]) + [key_result_level_entry]
+
+        if child_objective_ids:
+            next_visited = visited | {current_objective_id}
+            for child_objective_id in child_objective_ids:
+                child_name = objective_rows_by_id[child_objective_id]["item"].get("name", "")
                 yield from build_objective_key_result_paths(
-                    root_objective_row,
-                    child_objective_row,
+                    root_objective_id,
+                    child_objective_id,
                     current_workspace_level,
                     child_objective_path + [child_name],
                     next_visited,
                 )
 
     workspace_level = current_workspace_path[-1]
-    if root_objective_rows:
-        for root_objective_row in root_objective_rows:
+    if root_objective_ids:
+        for root_objective_id in root_objective_ids:
             yield from build_objective_key_result_paths(
-                root_objective_row,
-                root_objective_row,
+                root_objective_id,
+                root_objective_id,
                 workspace_level,
             )
     else:
