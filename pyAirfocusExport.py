@@ -280,7 +280,7 @@ def get_output_paths(workspace):
     legacy_path = get_default_output_path(workspace)
     prefix, _ = os.path.splitext(legacy_path)
     return {
-        "paths": legacy_path,
+        "full": f"{prefix}-full.csv",
         "nodes": f"{prefix}-nodes.csv",
         "edges": f"{prefix}-edges.csv",
         "management": f"{prefix}-management.csv",
@@ -1798,11 +1798,11 @@ def main():
         print(f"Unexpected error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"  Generated {len(rows)} legacy path rows", file=sys.stderr)
+    print(f"  Generated {len(rows)} full flat CSV rows", file=sys.stderr)
     output_paths = get_output_paths(parent_ws)
-    os.makedirs(os.path.dirname(output_paths["paths"]), exist_ok=True)
+    os.makedirs(os.path.dirname(output_paths["full"]), exist_ok=True)
 
-    with open(output_paths["paths"], "w", newline="", encoding="utf-8") as output_file:
+    with open(output_paths["full"], "w", newline="", encoding="utf-8") as output_file:
         write_path_csv(rows, output_file)
 
     with open(output_paths["nodes"], "w", newline="", encoding="utf-8") as output_file:
@@ -1818,7 +1818,7 @@ def main():
         f"  Generated {len(reporting_records)} reporting records and {len(relationship_rows)} relationships",
         file=sys.stderr,
     )
-    print(f"  Wrote path CSV to {output_paths['paths']}", file=sys.stderr)
+    print(f"  Wrote full CSV to {output_paths['full']}", file=sys.stderr)
     print(f"  Wrote reporting records CSV to {output_paths['nodes']}", file=sys.stderr)
     print(f"  Wrote relationships CSV to {output_paths['edges']}", file=sys.stderr)
     print(f"  Wrote management CSV to {output_paths['management']}", file=sys.stderr)

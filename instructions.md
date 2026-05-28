@@ -15,13 +15,13 @@
 * Running `uv run pyAirfocusExport.py` without arguments should list the accessible objective workspace hierarchy.
 * Export usage is `uv run pyAirfocusExport.py --parent "Objective Workspace Name"`
 * `--parent` accepts either the full workspace name or the workspace short name / alias.
-* By default, exporting with `--parent` writes five files under `Output/`: a legacy path CSV, normalized `-nodes.csv`, normalized `-edges.csv`, a management-friendly `-management.csv`, and a hierarchical `.json` file.
+* By default, exporting with `--parent` writes five files under `Output/`: a full `-full.csv`, normalized `-nodes.csv`, normalized `-edges.csv`, a management-friendly `-management.csv`, and a hierarchical `.json` file.
 
 # Implementation Plan
 
 ## CSV Output Columns
 
-The primary reporting output is normalized into `nodes` and `edges` CSV files. A spreadsheet-friendly `management.csv` and a hierarchical JSON export are also written from the same in-memory model. The legacy flat path CSV is still written for manual review.
+The primary reporting output is normalized into `nodes` and `edges` CSV files. A spreadsheet-friendly `management.csv`, a full `-full.csv`, and a hierarchical JSON export are also written from the same in-memory model.
 
 The hierarchy represented by the normalized export is:
 
@@ -89,7 +89,7 @@ Each `nodes.csv` row represents exactly one entity. Each `edges.csv` row represe
 
 The JSON export mirrors the workspace → objective → child objective → key result hierarchy as nested objects. It is intended for AI-assisted graphics generation and other consumers that work better with explicit nested children than with joined CSV files.
 
-### Legacy Path Columns
+### Full CSV Columns
 
 The top-level workspace columns use `Parent`. Deeper workspace levels use child prefixes such as `Child0`, `Child0-0`, `Child0-0-0`.
 
@@ -213,7 +213,7 @@ Use `Content-Type: application/json` and accept `application/json` (or `applicat
       - Build `edges.csv` with explicit parent-child links between workspaces, objectives, child objectives, and key results.
       - Build `management.csv` for spreadsheet-oriented filtering and pivoting.
       - Build hierarchical `.json` from the same in-memory export model for AI and nested consumers.
-      - Also write the legacy path CSV for manual review and backward compatibility.
+      - Also write the full `-full.csv` flat export for manual review and backward compatibility.
 
 ## Error Handling
 
