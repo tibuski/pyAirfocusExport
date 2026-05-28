@@ -303,34 +303,60 @@ def normalize_embedded_collection(value):
     return []
 
 
-def add_workspace_edge(parent_map, child_map, parent_id, child_id):
-    if not parent_id or not child_id or parent_id == child_id:
+def add_workspace_relationship(
+    parent_workspace_map,
+    child_workspace_map,
+    parent_workspace_id,
+    child_workspace_id,
+):
+    if (
+        not parent_workspace_id
+        or not child_workspace_id
+        or parent_workspace_id == child_workspace_id
+    ):
         return
-    child_map.setdefault(parent_id, set()).add(child_id)
-    parent_map.setdefault(child_id, set()).add(parent_id)
+    child_workspace_map.setdefault(parent_workspace_id, set()).add(child_workspace_id)
+    parent_workspace_map.setdefault(child_workspace_id, set()).add(parent_workspace_id)
 
 
-def discover_hierarchy_edges(node, accessible_ids, parent_map, child_map, current_parent=None):
-    if not isinstance(node, dict):
+def discover_workspace_relationships(
+    workspace_entry,
+    accessible_workspace_ids,
+    parent_workspace_map,
+    child_workspace_map,
+    current_parent_workspace_id=None,
+):
+    if not isinstance(workspace_entry, dict):
         return
 
-    workspace_id = node.get("workspaceId") or node.get("id")
-    if workspace_id not in accessible_ids:
+    workspace_id = workspace_entry.get("workspaceId") or workspace_entry.get("id")
+    if workspace_id not in accessible_workspace_ids:
         workspace_id = None
 
-    if current_parent and workspace_id:
-        add_workspace_edge(parent_map, child_map, current_parent, workspace_id)
+    if current_parent_workspace_id and workspace_id:
+        add_workspace_relationship(
+            parent_workspace_map,
+            child_workspace_map,
+            current_parent_workspace_id,
+            workspace_id,
+        )
 
-    next_parent = workspace_id or current_parent
-    for child in normalize_embedded_collection(node.get("children")):
-        discover_hierarchy_edges(child, accessible_ids, parent_map, child_map, next_parent)
+    next_parent_workspace_id = workspace_id or current_parent_workspace_id
+    for child_workspace in normalize_embedded_collection(workspace_entry.get("children")):
+        discover_workspace_relationships(
+            child_workspace,
+            accessible_workspace_ids,
+            parent_workspace_map,
+            child_workspace_map,
+            next_parent_workspace_id,
+        )
 
 
 def get_workspace_relationship_maps(workspaces):
     workspace_by_id = {workspace["id"]: workspace for workspace in workspaces}
-    accessible_ids = set(workspace_by_id)
-    child_map = {workspace_id: set() for workspace_id in workspace_by_id}
-    parent_map = {workspace_id: set() for workspace_id in workspace_by_id}
+    accessible_workspace_ids = set(workspace_by_id)
+    child_workspace_map = {workspace_id: set() for workspace_id in workspace_by_id}
+    parent_workspace_map = {workspace_id: set() for workspace_id in workspace_by_id}
 
     for workspace in workspaces:
         workspace_id = workspace["id"]
@@ -340,39 +366,49 @@ def get_workspace_relationship_maps(workspaces):
             settings = app.get("settings", {})
             hierarchy = settings.get("hierarchy")
             if isinstance(hierarchy, dict):
-                discover_hierarchy_edges(
+                discover_workspace_relationships(
                     hierarchy,
-                    accessible_ids,
-                    parent_map,
-                    child_map,
+                    accessible_workspace_ids,
+                    parent_workspace_map,
+                    child_workspace_map,
                 )
             elif isinstance(hierarchy, list):
-                for node in hierarchy:
-                    discover_hierarchy_edges(
-                        node,
-                        accessible_ids,
-                        parent_map,
-                        child_map,
+                for workspace_entry in hierarchy:
+                    discover_workspace_relationships(
+                        workspace_entry,
+                        accessible_workspace_ids,
+                        parent_workspace_map,
+                        child_workspace_map,
                     )
 
-        for child in normalize_embedded_collection(embedded.get("children")):
-            child_id = child.get("id") or child.get("workspaceId")
-            if child_id in accessible_ids:
-                add_workspace_edge(parent_map, child_map, workspace_id, child_id)
+        for child_workspace in normalize_embedded_collection(embedded.get("children")):
+            child_workspace_id = child_workspace.get("id") or child_workspace.get("workspaceId")
+            if child_workspace_id in accessible_workspace_ids:
+                add_workspace_relationship(
+                    parent_workspace_map,
+                    child_workspace_map,
+                    workspace_id,
+                    child_workspace_id,
+                )
 
-        for parent in normalize_embedded_collection(embedded.get("parents")):
-            parent_id = parent.get("id") or parent.get("workspaceId")
-            if parent_id in accessible_ids:
-                add_workspace_edge(parent_map, child_map, parent_id, workspace_id)
+        for parent_workspace in normalize_embedded_collection(embedded.get("parents")):
+            parent_workspace_id = parent_workspace.get("id") or parent_workspace.get("workspaceId")
+            if parent_workspace_id in accessible_workspace_ids:
+                add_workspace_relationship(
+                    parent_workspace_map,
+                    child_workspace_map,
+                    parent_workspace_id,
+                    workspace_id,
+                )
 
-    sorted_child_map = {
+    sorted_child_workspace_map = {
         workspace_id: sorted(
             child_ids,
             key=lambda child_id: workspace_by_id[child_id].get("name", "").lower(),
         )
-        for workspace_id, child_ids in child_map.items()
+        for workspace_id, child_ids in child_workspace_map.items()
     }
-    return workspace_by_id, sorted_child_map, parent_map
+    return workspace_by_id, sorted_child_workspace_map, parent_workspace_map
 
 
 def get_accessible_objective_workspaces(config, name=None):
@@ -413,7 +449,11 @@ def find_matching_workspaces(workspaces, query):
     ]
 
 
-def format_workspace_hierarchy_lines(workspace_by_id, child_map, top_level_ids):
+def format_workspace_hierarchy_lines(
+    workspace_by_id,
+    child_workspace_map,
+    root_workspace_ids,
+):
     lines = []
     visited = set()
 
@@ -428,11 +468,11 @@ def format_workspace_hierarchy_lines(workspace_by_id, child_map, top_level_ids):
             return rendered_ids
 
         next_path = path | {workspace_id}
-        for child_id in child_map.get(workspace_id, []):
+        for child_id in child_workspace_map.get(workspace_id, []):
             rendered_ids.update(render_node(child_id, depth + 1, next_path))
         return rendered_ids
 
-    for workspace_id in top_level_ids:
+    for workspace_id in root_workspace_ids:
         visited.update(render_node(workspace_id, 0, set()))
 
     remaining_ids = [
@@ -441,7 +481,7 @@ def format_workspace_hierarchy_lines(workspace_by_id, child_map, top_level_ids):
             workspace_by_id,
             key=lambda current_id: workspace_by_id[current_id].get("name", "").lower(),
         )
-        if workspace_id not in top_level_ids
+        if workspace_id not in root_workspace_ids
     ]
 
     for workspace_id in remaining_ids:
@@ -459,17 +499,21 @@ def print_accessible_objective_workspaces(config, stream):
         return 0
 
     print("Resolving accessible objective workspace hierarchy...", file=sys.stderr)
-    workspace_by_id, child_map, parent_map = get_workspace_relationship_maps(workspaces)
-    top_level_ids = [
+    workspace_by_id, child_workspace_map, parent_workspace_map = get_workspace_relationship_maps(workspaces)
+    root_workspace_ids = [
         workspace["id"]
         for workspace in sort_workspaces(workspaces)
-        if not parent_map.get(workspace["id"])
+        if not parent_workspace_map.get(workspace["id"])
     ]
-    if not top_level_ids:
-        top_level_ids = [workspace["id"] for workspace in sort_workspaces(workspaces)]
+    if not root_workspace_ids:
+        root_workspace_ids = [workspace["id"] for workspace in sort_workspaces(workspaces)]
 
     print("Accessible objective workspace hierarchy:", file=stream)
-    for line in format_workspace_hierarchy_lines(workspace_by_id, child_map, top_level_ids):
+    for line in format_workspace_hierarchy_lines(
+        workspace_by_id,
+        child_workspace_map,
+        root_workspace_ids,
+    ):
         print(line, file=stream)
     return len(workspaces)
 
@@ -837,32 +881,32 @@ def build_workspace_tree(
     items = paginated_search_items(config, parent_ws_id)
     print(f"    Found {len(items)} items", file=sys.stderr)
 
-    child_ws = []
-    child_ws_ids = [
-        child_ws_id
-        for child_ws_id in workspace_child_map.get(parent_ws_id, [])
-        if child_ws_id != parent_ws_id and child_ws_id not in visited
+    child_workspaces = []
+    child_workspace_ids = [
+        child_workspace_id
+        for child_workspace_id in workspace_child_map.get(parent_ws_id, [])
+        if child_workspace_id != parent_ws_id and child_workspace_id not in visited
     ]
-    if child_ws_ids:
+    if child_workspace_ids:
         print(
-            f"  Found {len(child_ws_ids)} child workspaces, building hierarchy...",
+            f"  Found {len(child_workspace_ids)} child workspaces, building hierarchy...",
             file=sys.stderr,
         )
-        for child_ws_id in child_ws_ids:
+        for child_workspace_id in child_workspace_ids:
             child = build_workspace_tree(
                 config,
-                child_ws_id,
+                child_workspace_id,
                 workspace_by_id,
                 workspace_child_map,
                 visited,
             )
             if child:
-                child_ws.append(child)
+                child_workspaces.append(child)
 
     return {
         "workspace": ws,
         "items": items,
-        "children": child_ws,
+        "children": child_workspaces,
     }
 
 
@@ -903,15 +947,15 @@ def get_key_result_label(key_result):
 
 def flatten_paths(
     config,
-    workspace_node,
+    workspace_tree,
     depth=0,
-    ancestor_ctx=None,
+    workspace_path_context=None,
     field_map_cache=None,
     resolved_item_cache=None,
     linked_workspace_item_cache=None,
 ):
-    if ancestor_ctx is None:
-        ancestor_ctx = []
+    if workspace_path_context is None:
+        workspace_path_context = []
     if field_map_cache is None:
         field_map_cache = {}
     if resolved_item_cache is None:
@@ -919,14 +963,14 @@ def flatten_paths(
     if linked_workspace_item_cache is None:
         linked_workspace_item_cache = {}
 
-    ws = workspace_node["workspace"]
+    ws = workspace_tree["workspace"]
     ws_name = ws.get("name", "")
-    items = workspace_node["items"]
-    children = workspace_node["children"]
+    items = workspace_tree["items"]
+    children = workspace_tree["children"]
 
     field_map = build_field_type_map(config, [ws["id"]], field_map_cache)
 
-    current_ctx = ancestor_ctx + [
+    current_workspace_path = workspace_path_context + [
         {
             "ws_name": ws_name,
             "objective_name": None,
@@ -946,7 +990,7 @@ def flatten_paths(
         linked_workspace_item_cache,
     )
 
-    item_kr_list = []
+    objective_key_result_rows = []
     for item in items:
         okr = extract_item_okr_fields(item, field_map)
 
@@ -984,7 +1028,7 @@ def flatten_paths(
                 for kr in resolved_krs:
                     kr_alias = get_key_result_label(kr)
                     kr_values = get_key_result_row_values(kr)
-                    item_kr_list.append(
+                    objective_key_result_rows.append(
                         {
                             "item": item,
                             "child_item": None,
@@ -996,7 +1040,7 @@ def flatten_paths(
                         }
                     )
             else:
-                item_kr_list.append(
+                objective_key_result_rows.append(
                     {
                         "item": item,
                         "child_item": None,
@@ -1012,7 +1056,7 @@ def flatten_paths(
             if linked_krs:
                 for kr in linked_krs:
                     kr_values = get_key_result_row_values(kr)
-                    item_kr_list.append(
+                    objective_key_result_rows.append(
                         {
                             "item": item,
                             "child_item": None,
@@ -1025,7 +1069,7 @@ def flatten_paths(
                     )
                 continue
 
-            item_kr_list.append(
+            objective_key_result_rows.append(
                 {
                     "item": item,
                     "child_item": None,
@@ -1037,7 +1081,7 @@ def flatten_paths(
                 }
             )
 
-    ws_items_parents = {}
+    workspace_item_parent_map = {}
     for item in items:
         embed = item.get("_embedded", {})
         parents_list = [
@@ -1045,66 +1089,80 @@ def flatten_paths(
             for p in embed.get("parents", [])
             if p.get("workspaceId") == ws["id"]
         ]
-        ws_items_parents[item["id"]] = parents_list
+        workspace_item_parent_map[item["id"]] = parents_list
 
-    top_level = [ik for ik in item_kr_list if not ws_items_parents.get(ik["item"]["id"])]
+    root_objective_rows = [
+        objective_row
+        for objective_row in objective_key_result_rows
+        if not workspace_item_parent_map.get(objective_row["item"]["id"])
+    ]
 
-    child_map = {}
-    for ik in item_kr_list:
-        iid = ik["item"]["id"]
-        parent_ids = ws_items_parents.get(iid, [])
-        for pid in parent_ids:
-            child_map.setdefault(pid, []).append(ik)
+    child_objective_map = {}
+    for objective_row in objective_key_result_rows:
+        item_id = objective_row["item"]["id"]
+        parent_item_ids = workspace_item_parent_map.get(item_id, [])
+        for parent_item_id in parent_item_ids:
+            child_objective_map.setdefault(parent_item_id, []).append(objective_row)
 
-    def build_kr_paths(root_ik, current_ik, current_ctx_level, child_objective_path=None, visited=None):
+    def build_objective_key_result_paths(
+        root_objective_row,
+        current_objective_row,
+        current_workspace_level,
+        child_objective_path=None,
+        visited=None,
+    ):
         if child_objective_path is None:
             child_objective_path = []
         if visited is None:
             visited = set()
 
-        current_id = current_ik["item"]["id"]
+        current_id = current_objective_row["item"]["id"]
         if current_id in visited:
             return
 
-        children_ik = child_map.get(current_id, [])
+        child_objective_rows = child_objective_map.get(current_id, [])
 
-        if current_ik["kr_alias"] is not None or not children_ik:
-            ctx_entry = current_ctx_level.copy()
-            ctx_entry["objective_name"] = root_ik["item"].get("name", "")
-            ctx_entry["child_objective_name"] = " > ".join(child_objective_path) or None
-            ctx_entry["kr_alias"] = current_ik["kr_alias"]
-            ctx_entry["status"] = current_ik["status"]
-            ctx_entry["confidence"] = current_ik["confidence"]
-            ctx_entry["progress"] = current_ik["progress"]
-            ctx_entry["time_period"] = current_ik["time_period"]
-            yield list(current_ctx[:-1]) + [ctx_entry]
+        if current_objective_row["kr_alias"] is not None or not child_objective_rows:
+            workspace_level_entry = current_workspace_level.copy()
+            workspace_level_entry["objective_name"] = root_objective_row["item"].get("name", "")
+            workspace_level_entry["child_objective_name"] = " > ".join(child_objective_path) or None
+            workspace_level_entry["kr_alias"] = current_objective_row["kr_alias"]
+            workspace_level_entry["status"] = current_objective_row["status"]
+            workspace_level_entry["confidence"] = current_objective_row["confidence"]
+            workspace_level_entry["progress"] = current_objective_row["progress"]
+            workspace_level_entry["time_period"] = current_objective_row["time_period"]
+            yield list(current_workspace_path[:-1]) + [workspace_level_entry]
 
-        if children_ik:
+        if child_objective_rows:
             next_visited = visited | {current_id}
-            for child_ik in children_ik:
-                child_name = child_ik["item"].get("name", "")
-                yield from build_kr_paths(
-                    root_ik,
-                    child_ik,
-                    current_ctx_level,
+            for child_objective_row in child_objective_rows:
+                child_name = child_objective_row["item"].get("name", "")
+                yield from build_objective_key_result_paths(
+                    root_objective_row,
+                    child_objective_row,
+                    current_workspace_level,
                     child_objective_path + [child_name],
                     next_visited,
                 )
 
-    ctx_level = current_ctx[-1]
-    if top_level:
-        for tl_item_kr in top_level:
-            yield from build_kr_paths(tl_item_kr, tl_item_kr, ctx_level)
+    workspace_level = current_workspace_path[-1]
+    if root_objective_rows:
+        for root_objective_row in root_objective_rows:
+            yield from build_objective_key_result_paths(
+                root_objective_row,
+                root_objective_row,
+                workspace_level,
+            )
     else:
-        yield list(current_ctx[:-1]) + [ctx_level]
+        yield list(current_workspace_path[:-1]) + [workspace_level]
 
     if children:
-        for child in children:
+        for child_workspace in children:
             yield from flatten_paths(
                 config,
-                child,
+                child_workspace,
                 depth + 1,
-                current_ctx,
+                current_workspace_path,
                 field_map_cache,
                 resolved_item_cache,
                 linked_workspace_item_cache,
@@ -1168,15 +1226,15 @@ def resolve_item_key_results(
 
 def build_reporting_rows(
     config,
-    workspace_node,
-    parent_workspace_node_id=None,
+    workspace_tree,
+    parent_workspace_record_id=None,
     field_map_cache=None,
     resolved_item_cache=None,
     linked_workspace_item_cache=None,
-    nodes=None,
-    node_keys=None,
-    edges=None,
-    edge_keys=None,
+    reporting_records=None,
+    reporting_record_keys=None,
+    relationship_rows=None,
+    relationship_keys=None,
 ):
     if field_map_cache is None:
         field_map_cache = {}
@@ -1184,26 +1242,26 @@ def build_reporting_rows(
         resolved_item_cache = {}
     if linked_workspace_item_cache is None:
         linked_workspace_item_cache = {}
-    if nodes is None:
-        nodes = []
-    if node_keys is None:
-        node_keys = set()
-    if edges is None:
-        edges = []
-    if edge_keys is None:
-        edge_keys = set()
+    if reporting_records is None:
+        reporting_records = []
+    if reporting_record_keys is None:
+        reporting_record_keys = set()
+    if relationship_rows is None:
+        relationship_rows = []
+    if relationship_keys is None:
+        relationship_keys = set()
 
-    workspace = workspace_node["workspace"]
+    workspace = workspace_tree["workspace"]
     workspace_id = workspace["id"]
     workspace_name = workspace.get("name", "")
-    workspace_node_id = f"workspace:{workspace_id}"
+    workspace_record_id = f"workspace:{workspace_id}"
 
     add_unique_row(
-        nodes,
-        node_keys,
-        workspace_node_id,
+        reporting_records,
+        reporting_record_keys,
+        workspace_record_id,
         {
-            "Id": workspace_node_id,
+            "Id": workspace_record_id,
             "NodeType": "workspace",
             "HierarchyRole": "workspace",
             "WorkspaceId": workspace_id,
@@ -1221,22 +1279,26 @@ def build_reporting_rows(
         },
     )
 
-    if parent_workspace_node_id:
-        edge_key = (parent_workspace_node_id, workspace_node_id, "workspace_child")
+    if parent_workspace_record_id:
+        relationship_key = (
+            parent_workspace_record_id,
+            workspace_record_id,
+            "workspace_child",
+        )
         add_unique_row(
-            edges,
-            edge_keys,
-            edge_key,
+            relationship_rows,
+            relationship_keys,
+            relationship_key,
             {
-                "SourceId": parent_workspace_node_id,
-                "TargetId": workspace_node_id,
+                "SourceId": parent_workspace_record_id,
+                "TargetId": workspace_record_id,
                 "RelationType": "workspace_child",
                 "WorkspaceId": workspace_id,
                 "WorkspaceName": workspace_name,
             },
         )
 
-    items = workspace_node["items"]
+    items = workspace_tree["items"]
     item_ids = {item.get("id") for item in items if item.get("id")}
     field_map = build_field_type_map(config, [workspace_id], field_map_cache)
     linked_krs_by_objective = build_linked_key_result_map(
@@ -1265,14 +1327,14 @@ def build_reporting_rows(
             resolved_item_cache,
         )
 
-        objective_node_id = f"item:{item_id}"
+        objective_record_id = f"item:{item_id}"
         hierarchy_role = "child_objective" if parent_item_ids else "objective"
         add_unique_row(
-            nodes,
-            node_keys,
-            objective_node_id,
+            reporting_records,
+            reporting_record_keys,
+            objective_record_id,
             {
-                "Id": objective_node_id,
+                "Id": objective_record_id,
                 "NodeType": "objective",
                 "HierarchyRole": hierarchy_role,
                 "WorkspaceId": workspace_id,
@@ -1292,28 +1354,36 @@ def build_reporting_rows(
 
         if parent_item_ids:
             for parent_item_id in parent_item_ids:
-                edge_key = (f"item:{parent_item_id}", objective_node_id, "objective_child")
+                relationship_key = (
+                    f"item:{parent_item_id}",
+                    objective_record_id,
+                    "objective_child",
+                )
                 add_unique_row(
-                    edges,
-                    edge_keys,
-                    edge_key,
+                    relationship_rows,
+                    relationship_keys,
+                    relationship_key,
                     {
                         "SourceId": f"item:{parent_item_id}",
-                        "TargetId": objective_node_id,
+                        "TargetId": objective_record_id,
                         "RelationType": "objective_child",
                         "WorkspaceId": workspace_id,
                         "WorkspaceName": workspace_name,
                     },
                 )
         else:
-            edge_key = (workspace_node_id, objective_node_id, "workspace_objective")
+            relationship_key = (
+                workspace_record_id,
+                objective_record_id,
+                "workspace_objective",
+            )
             add_unique_row(
-                edges,
-                edge_keys,
-                edge_key,
+                relationship_rows,
+                relationship_keys,
+                relationship_key,
                 {
-                    "SourceId": workspace_node_id,
-                    "TargetId": objective_node_id,
+                    "SourceId": workspace_record_id,
+                    "TargetId": objective_record_id,
                     "RelationType": "workspace_objective",
                     "WorkspaceId": workspace_id,
                     "WorkspaceName": workspace_name,
@@ -1325,17 +1395,17 @@ def build_reporting_rows(
                 continue
 
             key_result_raw_id = key_result.get("id") or f"{item_id}:{get_key_result_label(key_result)}"
-            key_result_node_id = f"kr:{key_result_raw_id}"
+            key_result_record_id = f"kr:{key_result_raw_id}"
             key_result_values = get_key_result_row_values(key_result)
             key_result_workspace_id = key_result.get("workspaceId") or workspace_id
             key_result_workspace_name = workspace_name
 
             add_unique_row(
-                nodes,
-                node_keys,
-                key_result_node_id,
+                reporting_records,
+                reporting_record_keys,
+                key_result_record_id,
                 {
-                    "Id": key_result_node_id,
+                    "Id": key_result_record_id,
                     "NodeType": "key_result",
                     "HierarchyRole": "key_result",
                     "WorkspaceId": key_result_workspace_id,
@@ -1353,35 +1423,39 @@ def build_reporting_rows(
                 },
             )
 
-            edge_key = (objective_node_id, key_result_node_id, "objective_key_result")
+            relationship_key = (
+                objective_record_id,
+                key_result_record_id,
+                "objective_key_result",
+            )
             add_unique_row(
-                edges,
-                edge_keys,
-                edge_key,
+                relationship_rows,
+                relationship_keys,
+                relationship_key,
                 {
-                    "SourceId": objective_node_id,
-                    "TargetId": key_result_node_id,
+                    "SourceId": objective_record_id,
+                    "TargetId": key_result_record_id,
                     "RelationType": "objective_key_result",
                     "WorkspaceId": workspace_id,
                     "WorkspaceName": workspace_name,
                 },
             )
 
-    for child_workspace in workspace_node["children"]:
+    for child_workspace in workspace_tree["children"]:
         build_reporting_rows(
             config,
             child_workspace,
-            parent_workspace_node_id=workspace_node_id,
+            parent_workspace_record_id=workspace_record_id,
             field_map_cache=field_map_cache,
             resolved_item_cache=resolved_item_cache,
             linked_workspace_item_cache=linked_workspace_item_cache,
-            nodes=nodes,
-            node_keys=node_keys,
-            edges=edges,
-            edge_keys=edge_keys,
+            reporting_records=reporting_records,
+            reporting_record_keys=reporting_record_keys,
+            relationship_rows=relationship_rows,
+            relationship_keys=relationship_keys,
         )
 
-    return nodes, edges
+    return reporting_records, relationship_rows
 
 
 def write_reporting_nodes_csv(rows, outfile):
@@ -1422,19 +1496,19 @@ def write_reporting_edges_csv(rows, outfile):
         writer.writerow(row)
 
 
-def build_management_rows(nodes, edges):
-    node_by_id = {node["Id"]: node for node in nodes}
-    objective_children = {}
-    objective_key_results = {}
+def build_management_rows(reporting_records, relationship_rows):
+    record_by_id = {record["Id"]: record for record in reporting_records}
+    child_objective_ids_by_objective = {}
+    key_result_ids_by_objective = {}
 
-    for edge in edges:
-        relation_type = edge["RelationType"]
-        source_id = edge["SourceId"]
-        target_id = edge["TargetId"]
+    for relationship in relationship_rows:
+        relation_type = relationship["RelationType"]
+        source_id = relationship["SourceId"]
+        target_id = relationship["TargetId"]
         if relation_type == "objective_child":
-            objective_children.setdefault(source_id, []).append(target_id)
+            child_objective_ids_by_objective.setdefault(source_id, []).append(target_id)
         elif relation_type == "objective_key_result":
-            objective_key_results.setdefault(source_id, []).append(target_id)
+            key_result_ids_by_objective.setdefault(source_id, []).append(target_id)
 
     rows = []
     seen_keys = set()
@@ -1445,90 +1519,90 @@ def build_management_rows(nodes, edges):
         seen_keys.add(key)
         rows.append(row)
 
-    for node in nodes:
-        if node["NodeType"] != "objective":
+    for objective_record in reporting_records:
+        if objective_record["NodeType"] != "objective":
             continue
 
-        objective_id = node["Id"]
-        child_ids = objective_children.get(objective_id, [])
-        key_result_ids = objective_key_results.get(objective_id, [])
+        objective_id = objective_record["Id"]
+        child_ids = child_objective_ids_by_objective.get(objective_id, [])
+        key_result_ids = key_result_ids_by_objective.get(objective_id, [])
 
         add_row(
             (objective_id, "objective", ""),
             {
-                "Workspace": node["WorkspaceName"],
-                "Objective": node["Title"],
+                "Workspace": objective_record["WorkspaceName"],
+                "Objective": objective_record["Title"],
                 "ChildObjective": "",
                 "KeyResult": "",
-                "Level": node["HierarchyRole"],
+                "Level": objective_record["HierarchyRole"],
                 "NodeType": "objective",
-                "StatusId": node["StatusId"],
-                "Confidence": node["Confidence"],
-                "Progress": node["Progress"],
-                "TimePeriod": node["TimePeriod"],
+                "StatusId": objective_record["StatusId"],
+                "Confidence": objective_record["Confidence"],
+                "Progress": objective_record["Progress"],
+                "TimePeriod": objective_record["TimePeriod"],
             },
         )
 
         for child_id in child_ids:
-            child = node_by_id.get(child_id)
-            if not child:
+            child_objective_record = record_by_id.get(child_id)
+            if not child_objective_record:
                 continue
             add_row(
                 (objective_id, "child_objective", child_id),
                 {
-                    "Workspace": child["WorkspaceName"],
-                    "Objective": node["Title"],
-                    "ChildObjective": child["Title"],
+                    "Workspace": child_objective_record["WorkspaceName"],
+                    "Objective": objective_record["Title"],
+                    "ChildObjective": child_objective_record["Title"],
                     "KeyResult": "",
-                    "Level": child["HierarchyRole"],
+                    "Level": child_objective_record["HierarchyRole"],
                     "NodeType": "child_objective",
-                    "StatusId": child["StatusId"],
-                    "Confidence": child["Confidence"],
-                    "Progress": child["Progress"],
-                    "TimePeriod": child["TimePeriod"],
+                    "StatusId": child_objective_record["StatusId"],
+                    "Confidence": child_objective_record["Confidence"],
+                    "Progress": child_objective_record["Progress"],
+                    "TimePeriod": child_objective_record["TimePeriod"],
                 },
             )
 
         for key_result_id in key_result_ids:
-            key_result = node_by_id.get(key_result_id)
-            if not key_result:
+            key_result_record = record_by_id.get(key_result_id)
+            if not key_result_record:
                 continue
             add_row(
                 (objective_id, "key_result", key_result_id),
                 {
-                    "Workspace": key_result["WorkspaceName"],
-                    "Objective": node["Title"],
+                    "Workspace": key_result_record["WorkspaceName"],
+                    "Objective": objective_record["Title"],
                     "ChildObjective": "",
-                    "KeyResult": key_result["Title"],
+                    "KeyResult": key_result_record["Title"],
                     "Level": "key_result",
                     "NodeType": "key_result",
-                    "StatusId": key_result["StatusId"],
-                    "Confidence": key_result["Confidence"],
-                    "Progress": key_result["Progress"],
-                    "TimePeriod": key_result["TimePeriod"],
+                    "StatusId": key_result_record["StatusId"],
+                    "Confidence": key_result_record["Confidence"],
+                    "Progress": key_result_record["Progress"],
+                    "TimePeriod": key_result_record["TimePeriod"],
                 },
             )
 
             for child_id in child_ids:
-                child_key_results = objective_key_results.get(child_id, [])
+                child_key_results = key_result_ids_by_objective.get(child_id, [])
                 if key_result_id not in child_key_results:
                     continue
-                child = node_by_id.get(child_id)
-                if not child:
+                child_objective_record = record_by_id.get(child_id)
+                if not child_objective_record:
                     continue
                 add_row(
                     (child_id, "child_key_result", key_result_id),
                     {
-                        "Workspace": key_result["WorkspaceName"],
-                        "Objective": node["Title"],
-                        "ChildObjective": child["Title"],
-                        "KeyResult": key_result["Title"],
+                        "Workspace": key_result_record["WorkspaceName"],
+                        "Objective": objective_record["Title"],
+                        "ChildObjective": child_objective_record["Title"],
+                        "KeyResult": key_result_record["Title"],
                         "Level": "key_result",
                         "NodeType": "key_result",
-                        "StatusId": key_result["StatusId"],
-                        "Confidence": key_result["Confidence"],
-                        "Progress": key_result["Progress"],
-                        "TimePeriod": key_result["TimePeriod"],
+                        "StatusId": key_result_record["StatusId"],
+                        "Confidence": key_result_record["Confidence"],
+                        "Progress": key_result_record["Progress"],
+                        "TimePeriod": key_result_record["TimePeriod"],
                     },
                 )
 
@@ -1554,43 +1628,47 @@ def write_management_csv(rows, outfile):
         writer.writerow(row)
 
 
-def build_hierarchical_export(nodes, edges):
-    node_by_id = {node["Id"]: node for node in nodes}
-    children_by_source = {}
-    for edge in edges:
-        children_by_source.setdefault(edge["SourceId"], []).append(edge)
+def build_hierarchical_export(reporting_records, relationship_rows):
+    record_by_id = {record["Id"]: record for record in reporting_records}
+    child_relationships_by_source = {}
+    for relationship in relationship_rows:
+        child_relationships_by_source.setdefault(relationship["SourceId"], []).append(relationship)
 
-    def format_node(node_id):
-        node = node_by_id[node_id]
+    def format_record(record_id):
+        record = record_by_id[record_id]
         payload = {
-            "id": node["Id"],
-            "type": node["NodeType"],
-            "role": node["HierarchyRole"],
-            "workspaceId": node["WorkspaceId"],
-            "workspaceName": node["WorkspaceName"],
-            "title": node["Title"],
-            "alias": node["Alias"],
-            "statusId": node["StatusId"],
-            "confidence": node["Confidence"],
-            "progress": node["Progress"],
-            "timePeriod": node["TimePeriod"],
-            "createdAt": node["CreatedAt"],
-            "updatedAt": node["UpdatedAt"],
-            "archived": node["Archived"],
-            "assigneeUserIds": [value for value in node["AssigneeUserIds"].split(",") if value],
+            "id": record["Id"],
+            "type": record["NodeType"],
+            "role": record["HierarchyRole"],
+            "workspaceId": record["WorkspaceId"],
+            "workspaceName": record["WorkspaceName"],
+            "title": record["Title"],
+            "alias": record["Alias"],
+            "statusId": record["StatusId"],
+            "confidence": record["Confidence"],
+            "progress": record["Progress"],
+            "timePeriod": record["TimePeriod"],
+            "createdAt": record["CreatedAt"],
+            "updatedAt": record["UpdatedAt"],
+            "archived": record["Archived"],
+            "assigneeUserIds": [value for value in record["AssigneeUserIds"].split(",") if value],
             "children": [],
         }
-        for edge in children_by_source.get(node_id, []):
+        for relationship in child_relationships_by_source.get(record_id, []):
             payload["children"].append(
                 {
-                    "relationType": edge["RelationType"],
-                    "node": format_node(edge["TargetId"]),
+                    "relationType": relationship["RelationType"],
+                    "node": format_record(relationship["TargetId"]),
                 }
             )
         return payload
 
-    root_nodes = [node["Id"] for node in nodes if node["NodeType"] == "workspace"]
-    return {"workspaces": [format_node(node_id) for node_id in root_nodes]}
+    root_workspace_record_ids = [
+        record["Id"]
+        for record in reporting_records
+        if record["NodeType"] == "workspace"
+    ]
+    return {"workspaces": [format_record(record_id) for record_id in root_workspace_record_ids]}
 
 
 def write_hierarchical_json(payload, outfile):
@@ -1703,7 +1781,7 @@ def main():
             )
         )
 
-        reporting_nodes, reporting_edges = build_reporting_rows(
+        reporting_records, relationship_rows = build_reporting_rows(
             config,
             tree,
             field_map_cache=field_map_cache,
@@ -1711,8 +1789,8 @@ def main():
             linked_workspace_item_cache=linked_workspace_item_cache,
         )
 
-        management_rows = build_management_rows(reporting_nodes, reporting_edges)
-        hierarchical_payload = build_hierarchical_export(reporting_nodes, reporting_edges)
+        management_rows = build_management_rows(reporting_records, relationship_rows)
+        hierarchical_payload = build_hierarchical_export(reporting_records, relationship_rows)
     except ExporterError as exc:
         print(exc, file=sys.stderr)
         sys.exit(1)
@@ -1728,18 +1806,21 @@ def main():
         write_path_csv(rows, output_file)
 
     with open(output_paths["nodes"], "w", newline="", encoding="utf-8") as output_file:
-        write_reporting_nodes_csv(reporting_nodes, output_file)
+        write_reporting_nodes_csv(reporting_records, output_file)
     with open(output_paths["edges"], "w", newline="", encoding="utf-8") as output_file:
-        write_reporting_edges_csv(reporting_edges, output_file)
+        write_reporting_edges_csv(relationship_rows, output_file)
     with open(output_paths["management"], "w", newline="", encoding="utf-8") as output_file:
         write_management_csv(management_rows, output_file)
     with open(output_paths["json"], "w", encoding="utf-8") as output_file:
         write_hierarchical_json(hierarchical_payload, output_file)
 
-    print(f"  Generated {len(reporting_nodes)} nodes and {len(reporting_edges)} edges", file=sys.stderr)
+    print(
+        f"  Generated {len(reporting_records)} reporting records and {len(relationship_rows)} relationships",
+        file=sys.stderr,
+    )
     print(f"  Wrote path CSV to {output_paths['paths']}", file=sys.stderr)
-    print(f"  Wrote nodes CSV to {output_paths['nodes']}", file=sys.stderr)
-    print(f"  Wrote edges CSV to {output_paths['edges']}", file=sys.stderr)
+    print(f"  Wrote reporting records CSV to {output_paths['nodes']}", file=sys.stderr)
+    print(f"  Wrote relationships CSV to {output_paths['edges']}", file=sys.stderr)
     print(f"  Wrote management CSV to {output_paths['management']}", file=sys.stderr)
     print(f"  Wrote JSON export to {output_paths['json']}", file=sys.stderr)
 
